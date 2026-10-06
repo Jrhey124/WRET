@@ -1,0 +1,53 @@
+{
+  "name": "wret",
+  "version": "1.0.0",
+  "description": "Build a browser-based analysis workbench for security analysts investigating suspicious web files. Users select files locally; the server supplies analysis tools; processing and project storage stay in the browser.",
+  "scripts": {
+    "tools:build": "node scripts/build-tools.mjs",
+    "dev": "npm run tools:build && vite",
+    "build": "npm run tools:build && tsc --noEmit && vite build",
+    "preview": "vite preview --host 127.0.0.1",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:e2e": "playwright test"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Jrhey124/WRET.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "module",
+  "bugs": {
+    "url": "https://github.com/Jrhey124/WRET/issues"
+  },
+  "homepage": "https://github.com/Jrhey124/WRET#readme",
+  "dependencies": {
+    "acorn": "8.18.0",
+    "acorn-walk": "8.3.5",
+    "eslint-scope": "9.1.2",
+    "monaco-editor": "0.57.0",
+    "prettier": "3.9.9",
+    "react": "19.3.0",
+    "react-dom": "19.3.0",
+    "wabt": "1.0.39"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.63.0",
+    "@types/eslint-scope": "8.4.0",
+    "@types/node": "26.6.4",
+    "@types/react": "19.3.0",
+    "@types/react-dom": "19.3.0",
+    "@vitejs/plugin-react": "6.1.1",
+    "esbuild": "0.28.2",
+    "fake-indexeddb": "6.2.5",
+    "typescript": "7.0.2",
+    "vite": "8.3.2",
+    "vitest": "5.0.3"
+  },
+  "private": true,
+  "overrides": {
+    "dompurify": "3.4.16"
+  }
+}

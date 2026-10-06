@@ -1,0 +1,13 @@
+node_modules
+dist
+.git
+.agents
+.codex
+public/tools
+test-results
+playwright-report
+*.local
+*.wret.json
+tests
+docs/screenshots
+.github

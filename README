@@ -1,0 +1,84 @@
+# WRET — Web Reverse-Engineering Tool
+
+## Run the application
+
+The browser-only MVP is implemented in this repository. Start the Docker deployment:
+
+```sh
+docker compose up --build -d
+```
+
+Open **http://localhost:8080**. For a remote server, use the included HTTPS configuration described in [Deployment](docs/DEPLOYMENT.md).
+
+For development with Node.js 24:
+
+```sh
+npm ci
+npm run dev
+```
+
+Validation: `npm test`, `npm run build`, then `npm run test:e2e` (install Playwright Chromium with `npx playwright install chromium`, or set `WRET_BROWSER=chrome` / `msedge`). On restricted Windows PowerShell, use `npm.cmd` / `npx.cmd`.
+
+Import files, select a finding or symbol to navigate to original evidence, and use **Notes** to add comments, bookmarks or function labels. **Export project** writes a portable `.wret.json` archive; **Export report** writes Markdown. The browser retains the current project locally. Export it before starting a new project or changing browser/origin.
+
+See [Development and verification](docs/DEVELOPMENT.md) for the implementation map, tool protocol, resource limits, analysis limitations and test coverage. The original requirements and future roadmap follow below.
+
+## Summary
+
+Build a browser-based analysis workbench for security analysts investigating suspicious web files. Users select files locally; the server supplies analysis tools; processing and project storage stay in the browser.
+
+The Ghidra inspiration is the investigation workflow: navigate code, inspect bytes, follow references, label discoveries, and save an analysis project.
+
+**First-release success:** an analyst can import an unfamiliar JavaScript/WASM sample, identify interesting functions and indicators, follow supporting references, annotate findings, and export a reproducible project.
+
+## MVP features
+
+- **Project workspace:** file explorer on the left, code or hex view in the center, references and findings on the right, analysis jobs below.
+- **File inspection:** JavaScript, HTML, CSS, JSON, source maps, and WebAssembly. Other files receive basic metadata, SHA-256 hashes, strings, and a hex view.
+- **JavaScript analysis:** formatting, syntax tree inspection, function outline, symbol references, and statically resolvable call relationships. Mark unresolved dynamic relationships explicitly.
+- **WebAssembly analysis:** section inspection, imports, exports, functions, and navigable WAT disassembly. Use browser-compatible WABT tooling; WAT is the initial representation rather than recovered high-level source. [WABT](https://github.com/WebAssembly/wabt)
+- **Investigation tools:** project-wide search, extracted URLs/domains, suspicious API usage, and a relationship graph connecting files, functions, and findings.
+- **Analyst notes:** comments, bookmarks, analyst-assigned function labels, and finding status. Preserve original evidence when creating formatted or decoded views.
+- **Reversible decoding:** Base64, hexadecimal, and URL decoding, with recorded input and transformation steps. Never execute decoded content.
+- **Export:** portable project archive and a Markdown report containing findings, notes, hashes, and evidence locations.
+
+Findings describe observable patterns; they do not automatically declare a sample malicious.
+
+## Architecture and interfaces
+
+- Use **TypeScript and React** for the interface, **Monaco** for code views, and **Web Workers** for parsing and analysis.
+- Serve the application and versioned tool bundles from a static HTTPS server. No sample-upload endpoint, accounts, or external analysis services in the MVP.
+- Load tools on demand from a first-party manifest containing tool ID, version, supported formats, entry point, and integrity hash. Pin tool versions within each project.
+- Give tools a common interface: accept evidence bytes and analysis options; emit progress, structured results, diagnostics, and evidence locations. Support cancellation and terminate stalled workers.
+- Represent evidence locations using file IDs and original byte offsets or source ranges. Derived views retain mappings to the original where available.
+- Store evidence, results, and notes in IndexedDB. Request persistent storage, handle quota failures visibly, and provide project export because browser storage may be evicted. [Browser storage behavior](https://developer.mozilla.org/en-US/docs/Web/API/Storage_API/Storage_quotas_and_eviction_criteria)
+- Display imported HTML as source. Do not instantiate imported WASM or run sample JavaScript. Workers keep analysis responsive but are not a containment boundary for executing malware.
+- Permit trusted analysis-tool downloads only; prohibit automatic fetching of URLs or source-map links found in samples. Exclude third-party analytics.
+
+## Delivery sequence and future features
+
+1. **Workbench foundation:** local import, hashes, project explorer, source/hex views, persistence, and project export/import.
+2. **JavaScript investigation:** parsing, formatting, outlines, references, search, indicator extraction, and notes.
+3. **WASM investigation:** WABT integration, section/function navigation, and linked byte/disassembly views.
+4. **MVP completion:** relationship graph, decoding history, reports, cancellation, resource limits, and privacy verification.
+
+After the MVP, prioritize:
+
+- **Sample comparison:** compare code, strings, imports, and indicators across versions.
+- **Deobfuscation assistance:** bounded constant folding and string reconstruction with a visible transformation history.
+- **Capture import:** HAR files and saved website bundles, linking requests to code references.
+- **Debugging:** a separate disposable-VM execution backend controlled through WRET, providing breakpoints, stepping, variables, and captured behavior. Define this boundary before implementing execution.
+- **Advanced analysis:** WASM control-flow graphs, decompiler research, local rule packs, and eventually constrained data-flow analysis.
+
+Native PE/ELF analysis and general-purpose Ghidra parity remain outside this roadmap’s first release.
+
+## Validation and defaults
+
+- Test normal, minified, obfuscated, malformed, and truncated samples; missing source maps; stripped WASM names; and unresolved dynamic calls.
+- Confirm every reference and finding navigates to supporting evidence, and formatting or decoding preserves original bytes.
+- Verify project export/import preserves evidence, notes, results, and tool versions.
+- Test cancellation, oversized inputs, worker failures, and storage exhaustion without losing existing notes.
+- Inspect network traffic to confirm sample bytes, extracted indicators, and notes never leave the browser.
+- Start with current desktop Chrome and Edge. Support multi-file import and WRET project archives; defer arbitrary archive extraction.
+- Set initial limits of **25 MiB per file and 100 MiB per project**, with clear rejection messages and adjustable limits after performance testing.
+- No live website browsing, sample execution, cloud AI, or automatic malware verdicts in the MVP.

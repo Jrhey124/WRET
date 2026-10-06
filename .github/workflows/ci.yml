@@ -1,0 +1,40 @@
+name: Validate WRET
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npm test
+      - run: npm run build
+      - run: npx playwright install --with-deps chromium
+      - run: npm run test:e2e
+      - name: Build and smoke-test Docker deployment
+        run: |
+          docker compose config --quiet
+          docker compose up --build --wait
+          curl --fail http://127.0.0.1:8080/healthz
+          curl --fail http://127.0.0.1:8080/tools/manifest.json
+          test "$(curl -s -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:8080/)" = "405"
+          curl -sI http://127.0.0.1:8080/ | grep -qi "Content-Security-Policy"
+          docker compose exec -T wret nginx -t
+      - name: Test the actual nginx container in the browser
+        run: npm run test:e2e
+        env:
+          WRET_BASE_URL: http://127.0.0.1:8080
+      - if: always()
+        run: docker compose down
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: browser-test-results
+          path: test-results/
