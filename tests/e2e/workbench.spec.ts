@@ -33,7 +33,7 @@ test("complete local investigation, navigation, notes, reports, archive round tr
   page.on("pageerror", (e) => errors.push(e.message));
   await page.goto("/");
   await expect(
-    page.getByRole("heading", { name: /Unfamiliar code/ }),
+    page.getByRole("heading", { name: /WRET: Web-based Reverse Engineering Tool/ }),
   ).toBeVisible();
   await page.screenshot({ path: "test-results/welcome.png", fullPage: true });
   await addSample(page);
@@ -54,7 +54,7 @@ test("complete local investigation, navigation, notes, reports, archive round tr
     .fill("Review the beacon argument; pattern only.");
   await page.getByRole("button", { name: "Save note", exact: true }).click();
   await expect(page.locator(".note-card")).toContainText("Review the beacon");
-  await page.getByRole("tab", { name: "Formatted", exact: true }).click();
+  await page.getByRole("tab", { name: "Beautified", exact: true }).click();
   await expect(
     page.getByText("Derived formatting ·", { exact: false }),
   ).toBeVisible();
@@ -109,9 +109,7 @@ test("complete local investigation, navigation, notes, reports, archive round tr
   const report = await readFile((await (await reportDownload).path())!, "utf8");
   expect(report).toContain(parsed.files[0].evidenceHash);
   expect(report).toContain("Review the beacon");
-  await expect(page.locator(".statusbar")).toContainText(
-    "Saved in this browser",
-  );
+  await expect(page.locator(".statusbar")).not.toContainText("Saved in this browser");
   await page.reload();
   await expect(page.locator(".file-row")).toHaveCount(1);
   await page.getByRole("button", { name: "Notes", exact: true }).click();

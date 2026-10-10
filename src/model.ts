@@ -43,6 +43,10 @@ export interface Evidence {
   format: Format;
   bytes: Uint8Array;
   hash?: string;
+  runtimeUrl?: string;
+  sourceMapOf?: string;
+  derivation?: { sourceId?: string; sourceHash: string; recipe: string; createdAt: string; changes: number };
+  captureKind?: "snapshot" | "script" | "response" | "live-edit";
   result?: Analysis;
 }
 export interface Note {
@@ -53,11 +57,25 @@ export interface Note {
 }
 export interface Decode {
   id: string;
-  operation: "base64" | "hex" | "url";
+  operation: "base64" | "hex" | "url" | "strings" | "nested" | "gzip" | "deflate";
   input: string;
   output: string;
   location: Location;
   createdAt: string;
+}
+export interface Transformation {
+  id: string;
+  parentEvidenceId?: string;
+  parentHash: string;
+  inputRange: { start: number; end: number };
+  operation: string;
+  version: 1;
+  parameters: Record<string, string | number | boolean>;
+  createdAt: string;
+  outputEvidenceId: string;
+  outputHash: string;
+  mapping: "exact" | "range" | "unknown";
+  parentUnavailable?: boolean;
 }
 export interface ToolPin {
   id: string;
@@ -67,7 +85,7 @@ export interface ToolPin {
   integrity: string;
 }
 export interface Project {
-  schema: 1;
+  schema: 1 | 2 | 3 | 4;
   id: string;
   name: string;
   createdAt: string;
@@ -75,6 +93,9 @@ export interface Project {
   notes: Note[];
   decodes: Decode[];
   tools: ToolPin[];
+  sessions?: import("./debug-types").DebugSession[];
+  breakpoints?: import("./debug-types").Breakpoint[];
+  transformations?: Transformation[];
 }
 export interface Job {
   id: string;
@@ -86,7 +107,7 @@ export interface Job {
 export const uid = () => crypto.randomUUID();
 export function newProject(): Project {
   return {
-    schema: 1,
+    schema: 4,
     id: uid(),
     name: "Untitled investigation",
     createdAt: new Date().toISOString(),
@@ -94,6 +115,35 @@ export function newProject(): Project {
     notes: [],
     decodes: [],
     tools: [],
+    sessions: [],
+    breakpoints: [],
+    transformations: [],
+  };
+}
+/** Remove one imported evidence item and project records anchored to it. */
+export function removeEvidence(project: Project, evidenceId: string): Project {
+  const evidence = project.files.find((file) => file.id === evidenceId);
+  if (!evidence) return project;
+  return {
+    ...project,
+    files: project.files.filter((file) => file.id !== evidenceId).map((file) => ({
+      ...file,
+      sourceMapOf: file.sourceMapOf === evidenceId ? undefined : file.sourceMapOf,
+      derivation: file.derivation?.sourceId === evidenceId ? { ...file.derivation, sourceId: undefined } : file.derivation,
+    })),
+    transformations: (project.transformations || []).filter((entry) => entry.outputEvidenceId !== evidenceId).map((entry) => entry.parentEvidenceId === evidenceId ? { ...entry, parentUnavailable: true } : entry),
+    sessions: project.sessions?.map((session) => ({ ...session, requests: session.requests?.map((request) => request.evidenceId === evidenceId ? { ...request, evidenceId: undefined, truncated: true } : request) })),
+    notes: project.notes.filter((note) => note.location.fileId !== evidenceId),
+    decodes: project.decodes.filter((decode) => decode.location.fileId !== evidenceId),
+    breakpoints: (project.breakpoints || []).filter((breakpoint) => {
+      if (evidence.runtimeUrl && breakpoint.url === evidence.runtimeUrl) return false;
+      try {
+        const path = decodeURIComponent(new URL(breakpoint.url).pathname.replace(/^\/+/, ""));
+        return path !== evidence.name;
+      } catch {
+        return true;
+      }
+    }),
   };
 }
 export function detectFormat(name: string, bytes: Uint8Array): Format {

@@ -1,0 +1,7 @@
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends chromium python3 python3-websocket && rm -rf /var/lib/apt/lists/*
+RUN useradd --create-home wret
+COPY guest/agent.py /opt/wret/agent.py
+USER wret
+ENV WRET_AGENT_TEST_STDIO=1
+ENTRYPOINT ["python3", "/opt/wret/agent.py"]

@@ -11,3 +11,6 @@ playwright-report
 tests
 docs/screenshots
 .github
+dist-companion
+.wret-vm
+guest/__pycache__

@@ -4,3 +4,6 @@ public/tools/
 test-results/
 playwright-report/
 *.local
+dist-companion/
+.wret-vm/
+guest/__pycache__/

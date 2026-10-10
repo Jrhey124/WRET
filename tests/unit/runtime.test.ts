@@ -39,10 +39,11 @@ async function environment(mode: "stalled" | "error" | "result" = "stalled") {
     onmessage?: (event: any) => void;
     onerror?: (event: any) => void;
     terminate = terminate;
-    postMessage() {
+    postMessage(message: any) {
       if (mode === "error")
         setTimeout(() => this.onerror?.({ message: "parse crash" }), 0);
-      if (mode === "result")
+      if (message.type === "chunk") setTimeout(() => this.onmessage?.({ data: { type: "ack", sequence: message.sequence } }), 0);
+      if (mode === "result" && message.type === "finish")
         setTimeout(
           () =>
             this.onmessage?.({

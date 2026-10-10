@@ -1,4 +1,4 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import * as monaco from "monaco-editor/editor";
 import EditorWorker from "monaco-editor/editor/editor.worker?worker";
 import "monaco-editor/languages/definitions/javascript/register";
@@ -10,20 +10,20 @@ import type { Location, Evidence } from "./model";
 import { sourceLineStarts, sourcePosition, offsetToByte } from "./model";
 (self as any).MonacoEnvironment = { getWorker: () => new EditorWorker() };
 monaco.editor.defineTheme("wret", {
-  base: "vs-dark",
+  base: "vs",
   inherit: true,
   rules: [
-    { token: "comment", foreground: "6e8595" },
-    { token: "string", foreground: "b9d98d" },
-    { token: "keyword", foreground: "bfabed" },
+    { token: "comment", foreground: "69757d" },
+    { token: "string", foreground: "52733d" },
+    { token: "keyword", foreground: "694e91" },
   ],
   colors: {
-    "editor.background": "#101820",
-    "editor.foreground": "#ced9e3",
-    "editorLineNumber.foreground": "#496071",
-    "editorLineNumber.activeForeground": "#78d4c3",
-    "editor.selectionBackground": "#31535a",
-    "editor.lineHighlightBackground": "#15212b",
+    "editor.background": "#ffffff",
+    "editor.foreground": "#252d33",
+    "editorLineNumber.foreground": "#859098",
+    "editorLineNumber.activeForeground": "#315f7b",
+    "editor.selectionBackground": "#c8dce8",
+    "editor.lineHighlightBackground": "#f4f7f8",
   },
 });
 export function Editor({
@@ -33,6 +33,8 @@ export function Editor({
   location,
   line,
   onSelection,
+  onBreakpoint,
+  breakpointLines = [],
 }: {
   file: Evidence;
   value: string;
@@ -40,12 +42,29 @@ export function Editor({
   location?: Location;
   line?: number;
   onSelection: (l: Location) => void;
+  onBreakpoint?: (line: number) => void;
+  breakpointLines?: number[];
 }) {
   const host = useRef<HTMLDivElement>(null);
+  const [page, setPage] = useState(0);
   const editor = useRef<monaco.editor.IStandaloneCodeEditor | null>(null);
   const selectionCallback = useRef(onSelection);
   selectionCallback.current = onSelection;
+  const breakpointCallback = useRef(onBreakpoint);
+  breakpointCallback.current = onBreakpoint;
+  const decorations = useRef<string[]>([]);
+  const paged = original && file.bytes.length > 2 * 1024 * 1024;
+  const pageBytes = 256 * 1024;
+  const pageStart = page * pageBytes;
+  let pageEnd = Math.min(file.bytes.length, pageStart + pageBytes);
+  while (pageEnd < file.bytes.length && (file.bytes[pageEnd] & 0xc0) === 0x80) pageEnd++;
+  let textStart = pageStart;
+  while (textStart < pageEnd && (file.bytes[textStart] & 0xc0) === 0x80) textStart++;
+  const pageText = paged ? new TextDecoder().decode(file.bytes.subarray(textStart, pageEnd)) : "";
+  useEffect(() => setPage(0), [file.id]);
+  useEffect(() => { if (paged && location?.fileId === file.id) setPage(Math.floor(location.start / pageBytes)); }, [paged, file.id, location?.fileId, location?.start]);
   useEffect(() => {
+    if (paged) return;
     const model = monaco.editor.createModel(
       value,
       original
@@ -61,6 +80,7 @@ export function Editor({
       model,
       theme: "wret",
       readOnly: true,
+      glyphMargin: original && file.format === "javascript",
       automaticLayout: true,
       minimap: { enabled: false },
       fontSize: 13,
@@ -89,13 +109,36 @@ export function Editor({
         end: offsetToByte(value, end),
       });
     });
+    const gutter = instance.onMouseDown((event) => {
+      if (
+        event.target.type ===
+          monaco.editor.MouseTargetType.GUTTER_GLYPH_MARGIN &&
+        event.target.position
+      )
+        breakpointCallback.current?.(event.target.position.lineNumber);
+    });
     return () => {
+      gutter.dispose();
+      decorations.current = [];
       listener.dispose();
       instance.dispose();
       model.dispose();
       editor.current = null;
     };
   }, [file.id, file.format, value, original]);
+  useEffect(() => {
+    if (!editor.current) return;
+    decorations.current = editor.current.deltaDecorations(
+      decorations.current,
+      breakpointLines.map((line) => ({
+        range: new monaco.Range(line, 1, line, 1),
+        options: {
+          glyphMarginClassName: "wret-breakpoint",
+          glyphMarginHoverMessage: { value: "Breakpoint: click to remove" },
+        },
+      })),
+    );
+  }, [breakpointLines, file.id, value]);
   useEffect(() => {
     const instance = editor.current,
       model = instance?.getModel();
@@ -118,6 +161,17 @@ export function Editor({
       instance.setPosition({ lineNumber: line, column: 1 }, "wret");
     }
   }, [file, location, original, line]);
+  if (paged) return <div className="large-source-page" aria-label="Paged large source viewer">
+    <div className="large-source-toolbar"><strong>{file.format.toUpperCase()} · large file paging</strong><button disabled={page === 0} onClick={() => setPage((value) => Math.max(0, value - 1))}>Previous page</button><span>Page {page + 1} of {Math.ceil(file.bytes.length / pageBytes)}</span><button disabled={pageEnd >= file.bytes.length} onClick={() => setPage((value) => value + 1)}>Next page</button><span>Bytes {textStart.toLocaleString()}–{pageEnd.toLocaleString()}</span></div>
+    <p className="panel-help">Large evidence is shown in 256 KiB pages to keep the editor responsive. Breakpoints and syntax coloring are available in Monaco for files up to 2 MiB.</p>
+    <pre onMouseUp={() => {
+      const selection = window.getSelection();
+      if (!selection || selection.isCollapsed || !selection.anchorNode || selection.anchorNode !== selection.focusNode || selection.anchorNode.nodeType !== Node.TEXT_NODE) return;
+      const start = Math.min(selection.anchorOffset, selection.focusOffset), end = Math.max(selection.anchorOffset, selection.focusOffset);
+      const encoder = new TextEncoder();
+      onSelection({ fileId: file.id, start: textStart + encoder.encode(pageText.slice(0, start)).length, end: textStart + encoder.encode(pageText.slice(0, end)).length });
+    }}><code>{pageText}</code></pre>
+  </div>;
   return (
     <div
       className="editor-host"

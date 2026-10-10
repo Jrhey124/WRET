@@ -1,5 +1,7 @@
 # Docker deployment
 
+This image provides static inspection. Dynamic debugging runs through `npm.cmd run companion` on Windows with QEMU and a prepared guest, documented in [Companion setup](COMPANION.md). The companion binds its UI and authenticated API to the same loopback origin and does not require a hosted account or database.
+
 ## Local workstation
 
 ```sh

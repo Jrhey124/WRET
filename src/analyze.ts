@@ -4,6 +4,8 @@ import { analyze as analyzeScopes } from "eslint-scope";
 import * as prettier from "prettier/standalone";
 import * as babel from "prettier/plugins/babel";
 import * as estree from "prettier/plugins/estree";
+import * as htmlPlugin from "prettier/plugins/html";
+import * as postcssPlugin from "prettier/plugins/postcss";
 import wabtFactory from "wabt";
 import {
   decodeText,
@@ -16,6 +18,23 @@ import {
   type Evidence,
   type Item,
 } from "./model";
+
+export async function beautifyEvidence(file: Evidence): Promise<string> {
+  if (file.bytes.length > 5 * 1024 * 1024) throw new Error("Beautify supports files up to 5 MiB.");
+  const text = new TextDecoder("utf-8", { fatal: true }).decode(file.bytes);
+  let output: string;
+  if (file.format === "html") {
+    output = await prettier.format(text, { parser: "html", plugins: [htmlPlugin, babel, estree, postcssPlugin] });
+  } else if (file.format === "javascript") {
+    output = await prettier.format(text, { parser: "babel", plugins: [babel, estree] });
+  } else if (file.format === "css") {
+    output = await prettier.format(text, { parser: "css", plugins: [postcssPlugin] });
+  } else if (file.format === "json" || file.format === "sourcemap") {
+    output = await prettier.format(text, { parser: "json-stringify", plugins: [babel, estree] });
+  } else throw new Error("Beautify supports HTML, JavaScript, CSS, JSON, and source maps.");
+  if (new TextEncoder().encode(output).length > 20 * 1024 * 1024) throw new Error("Beautified output exceeds the 20 MiB limit.");
+  return output;
+}
 
 export async function analyzeFile(
   file: Evidence,

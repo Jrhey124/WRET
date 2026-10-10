@@ -8,7 +8,9 @@ import {
   type ComponentProps,
 } from "react";
 import { Graph } from "./Graph";
-import { decodeValue } from "./decoding";
+import { Tooltip } from "./Tooltip";
+import { GlobalTooltips } from "./GlobalTooltips";
+import { runResearchJob } from "./research-runtime";
 import {
   exportProject,
   importProject,
@@ -17,13 +19,14 @@ import {
   saveProject,
   validateProjectBudgets,
 } from "./storage";
-import { loadTool, runAnalysis } from "./runtime";
+import { loadTool, runAnalysis, WORKER_TIMEOUT } from "./runtime";
 import {
   decodeText,
   detectFormat,
   FILE_LIMIT,
   PROJECT_LIMIT,
   newProject,
+  removeEvidence as removeProjectEvidence,
   sha256,
   uid,
   type Evidence,
@@ -34,6 +37,20 @@ import {
   type Project,
 } from "./model";
 import SearchWorker from "./search.worker?worker";
+import { DebugPanel } from "./DebugPanel";
+import { NetworkView } from "./NetworkView";
+import { ResearchView } from "./ResearchView";
+import { StaticRenderView } from "./StaticRenderView";
+import { buildStaticPreview } from "./static-render";
+import wretLogoUrl from "./assets/wret-logo.png";
+import BeautifyWorker from "./analysis.worker?worker";
+import { parseHar } from "./har";
+import {
+  dependencies,
+  sourceMappings,
+  evidencePath,
+  embeddedSources,
+} from "./investigation";
 
 const LazyEditor = lazy(() =>
   import("./Editor").then((m) => ({ default: m.Editor })),
@@ -49,9 +66,19 @@ function Editor(props: ComponentProps<typeof LazyEditor>) {
 }
 
 type View =
-  "Original" | "Hex" | "Formatted" | "AST" | "WAT" | "Graph" | "Decode";
+  "Original" | "Hex" | "Beautified" | "AST" | "WAT" | "Graph" | "Decode" | "Render";
 type Panel =
   "Findings" | "Symbols" | "Search" | "Notes" | "Strings" | "Sections";
+const WELCOME_TAB_ID = "__wret_welcome__";
+type PaletteCommand = {
+  id: string;
+  label: string;
+  description: string;
+  keywords: string;
+  shortcut?: string;
+  disabledReason?: string;
+  run: () => void;
+};
 const size = (bytes: number) =>
   bytes < 1024
     ? `${bytes} B`
@@ -68,7 +95,12 @@ function download(name: string, content: string, type: string) {
 }
 function validText(file: Evidence) {
   try {
-    new TextDecoder("utf-8", { fatal: true }).decode(file.bytes);
+    const decoder = new TextDecoder("utf-8", { fatal: true });
+    if (file.bytes.length > 2 * 1024 * 1024) {
+      for (let offset = 0; offset < file.bytes.length; offset += 256 * 1024)
+        decoder.decode(file.bytes.subarray(offset, Math.min(file.bytes.length, offset + 256 * 1024)), { stream: true });
+      decoder.decode();
+    } else decoder.decode(file.bytes);
     return file.format !== "wasm" && file.format !== "binary";
   } catch {
     return false;
@@ -76,19 +108,38 @@ function validText(file: Evidence) {
 }
 
 export function App() {
+  const [mode, setMode] = useState<"Overview" | "Inspect" | "Network" | "Research" | "Debug" | "Report">(
+    "Overview",
+  );
+  const [palette, setPalette] = useState(false);
+  const [paletteQuery, setPaletteQuery] = useState("");
+  const [activeCommand, setActiveCommand] = useState(0);
+  const folderInput = useRef<HTMLInputElement>(null);
+  const filesInput = useRef<HTMLInputElement>(null),
+    archiveInput = useRef<HTMLInputElement>(null),
+    commandInput = useRef<HTMLInputElement>(null),
+    harInput = useRef<HTMLInputElement>(null);
+  const paletteReturnFocus = useRef<HTMLElement | null>(null);
   const [project, setProject] = useState<Project>(newProject);
   const current = useRef(project);
   current.current = project;
   const [ready, setReady] = useState(false),
-    [selected, setSelected] = useState("");
+    [selected, setSelected] = useState(WELCOME_TAB_ID);
+  const [openTabs, setOpenTabs] = useState<string[]>([WELCOME_TAB_ID]);
+  const [fileMenu, setFileMenu] = useState<{ id: string; x: number; y: number }>();
   const [view, setView] = useState<View>("Original"),
     [panel, setPanel] = useState<Panel>("Findings");
   const [location, setLocation] = useState<Location>(),
     [watLine, setWatLine] = useState<number>();
   const [jobs, setJobs] = useState<Job[]>([]),
     [busy, setBusy] = useState(false);
-  const [error, setError] = useState(""),
-    [storage, setStorage] = useState("Opening local project…");
+  const [error, setError] = useState("");
+  const [beautified, setBeautified] = useState<Record<string, string>>({});
+  const [beautifying, setBeautifying] = useState(false);
+  const beautifyWorker = useRef<Worker | undefined>(undefined);
+  const beautifyTimeout = useRef<number | undefined>(undefined);
+  useEffect(() => () => { beautifyWorker.current?.terminate(); if (beautifyTimeout.current) clearTimeout(beautifyTimeout.current); }, []);
+  const [debugHandoff, setDebugHandoff] = useState<{ entry: string; files: string[] }>();
   const [storageError, setStorageError] = useState(""),
     [persistent, setPersistent] = useState(false);
   const [restoreFailed, setRestoreFailed] = useState(false);
@@ -98,7 +149,9 @@ export function App() {
   const [noteText, setNoteText] = useState(""),
     [noteKind, setNoteKind] = useState<Note["kind"]>("comment");
   const [decodeInput, setDecodeInput] = useState(""),
-    [operation, setOperation] = useState<"base64" | "hex" | "url">("base64");
+    [operation, setOperation] = useState<
+      "base64" | "hex" | "url" | "strings" | "nested" | "gzip" | "deflate"
+    >("base64");
   const [decodeOrigin, setDecodeOrigin] = useState<Location>();
   const [hexPage, setHexPage] = useState(0),
     [jump, setJump] = useState("0");
@@ -110,17 +163,23 @@ export function App() {
     writeQueue = useRef(Promise.resolve()),
     revision = useRef(0),
     savedRevision = useRef(0);
-  const filesInput = useRef<HTMLInputElement>(null),
-    archiveInput = useRef<HTMLInputElement>(null);
   const file = project.files.find((f) => f.id === selected);
   const result = file?.result;
+  const resources = useMemo(() => dependencies(project.files), [project.files]);
+  const mapping = useMemo(
+    () =>
+      file
+        ? sourceMappings(project.files, file)
+        : { mappings: [], diagnostics: [] },
+    [project.files, file],
+  );
   const totalBytes = project.files.reduce((sum, f) => sum + f.bytes.length, 0);
   const findings = project.files.reduce(
     (sum, f) => sum + (f.result?.findings.length || 0),
     0,
   );
   const originalText = useMemo(
-    () => (file && validText(file) ? decodeText(file.bytes) : undefined),
+    () => (file && validText(file) ? file.bytes.length > 2 * 1024 * 1024 ? "" : decodeText(file.bytes) : undefined),
     [file],
   );
   const update = (fn: (p: Project) => Project) => {
@@ -140,6 +199,40 @@ export function App() {
     }
   }
 
+  function openPalette() {
+    if (palette) return;
+    paletteReturnFocus.current = document.activeElement instanceof HTMLElement
+      ? document.activeElement
+      : null;
+    setPaletteQuery("");
+    setActiveCommand(0);
+    setPalette(true);
+  }
+  function closePalette() {
+    setPalette(false);
+    setPaletteQuery("");
+  }
+  useEffect(() => {
+    const shortcuts = (event: KeyboardEvent) => {
+      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "k") {
+        const target = event.target;
+        if (target instanceof Element && target.closest("input, textarea, select, [contenteditable='true'], .monaco-editor")) return;
+        event.preventDefault();
+        if (palette) closePalette();
+        else openPalette();
+      }
+      if (event.key === "Escape") {
+        if (palette) closePalette();
+        setFileMenu(undefined);
+      }
+    };
+    window.addEventListener("keydown", shortcuts);
+    return () => window.removeEventListener("keydown", shortcuts);
+  }, [palette]);
+  useEffect(() => {
+    if (palette) commandInput.current?.focus();
+    else paletteReturnFocus.current?.focus();
+  }, [palette]);
   useEffect(() => {
     let alive = true;
     loadProject()
@@ -148,7 +241,14 @@ export function App() {
         if (p) {
           current.current = p;
           setProject(p);
-          setSelected(p.files[0]?.id || "");
+          if (p.files.length) setMode("Inspect");
+          if (p.files[0]) {
+            setSelected(p.files[0].id);
+            setOpenTabs((tabs) => [
+              ...(tabs.includes(WELCOME_TAB_ID) ? [WELCOME_TAB_ID] : []),
+              p.files[0].id,
+            ]);
+          }
           if (p.files[0] && !validText(p.files[0])) setView("Hex");
         }
       })
@@ -174,20 +274,16 @@ export function App() {
   useEffect(() => {
     if (!ready || restoreFailed) return;
     const rev = ++revision.current;
-    setStorage("Unsaved changes");
     const timer = setTimeout(() => {
-      setStorage("Saving locally…");
       writeQueue.current = writeQueue.current
         .then(() => saveProject(project))
         .then(() => {
           savedRevision.current = rev;
           if (revision.current === rev) {
-            setStorage("Saved in this browser");
             setStorageError("");
           }
         })
         .catch((e) => {
-          setStorage("Not saved");
           setStorageError(
             `Browser storage failed: ${String(e)}. Your current work is still in memory. Export your project now, then free browser storage and retry.`,
           );
@@ -195,6 +291,24 @@ export function App() {
     }, 350);
     return () => clearTimeout(timer);
   }, [project, ready, restoreFailed]);
+  useEffect(() => {
+    const checkpoint = setInterval(() => {
+      if (!ready || restoreFailed || revision.current === savedRevision.current)
+        return;
+      const revisionAtSave = revision.current;
+      writeQueue.current = writeQueue.current
+        .then(() => saveProject(current.current))
+        .then(() => {
+          savedRevision.current = revisionAtSave;
+        })
+        .catch((e) => {
+          setStorageError(
+            `Checkpoint failed: ${String(e)}. Export your project to preserve captured evidence.`,
+          );
+        });
+    }, 3000);
+    return () => clearInterval(checkpoint);
+  }, [ready, restoreFailed]);
   useEffect(() => {
     const warn = (e: BeforeUnloadEvent) => {
       if (revision.current !== savedRevision.current || lock.current) {
@@ -217,50 +331,72 @@ export function App() {
     }
     setSearching(true);
     let worker: Worker | undefined;
-    let deadline: ReturnType<typeof setTimeout> | undefined;
     const timer = setTimeout(() => {
       worker = new SearchWorker();
-      deadline = setTimeout(() => {
-        worker?.terminate();
-        setSearching(false);
-        setError(
-          "Search exceeded 60 seconds and was stopped. Refine the query.",
-        );
-      }, 60000);
+      let resolveAck: (() => void) | undefined;
+      let rejectAck: ((error: Error) => void) | undefined;
+      let resolveDone: ((items: Item[]) => void) | undefined;
+      let rejectDone: ((error: Error) => void) | undefined;
+      let expectedAck: number | undefined;
+      let activeDeadline: ReturnType<typeof setTimeout> | undefined;
       worker.onmessage = (e) => {
-        clearTimeout(deadline);
-        setMatches(e.data);
-        setSearching(false);
-        worker?.terminate();
+        if (e.data.type === "ack") {
+          if (e.data.sequence !== expectedAck) { rejectAck?.(new Error("Search worker returned an invalid chunk acknowledgment")); return; }
+          resolveAck?.(); resolveAck = undefined;
+        }
+        else if (e.data.type === "result") { resolveDone?.(e.data.results); resolveDone = undefined; }
+        else if (e.data.type === "error") { const error = new Error(e.data.error); rejectAck?.(error); rejectDone?.(error); rejectAck = undefined; rejectDone = undefined; }
       };
-      worker.onerror = () => {
-        clearTimeout(deadline);
-        setError(
-          "Search worker failed. Shorten the query or reduce the project size.",
-        );
-        setSearching(false);
-        worker?.terminate();
+      worker.onerror = () => { const error = new Error("Search worker failed"); rejectAck?.(error); rejectDone?.(error); };
+      const run = async () => {
+        const all: Item[] = [];
+        try {
+          for (const file of project.files) {
+            if (all.length >= 500) break;
+            const jobId = uid();
+            const done = new Promise<Item[]>((resolve, reject) => { resolveDone = resolve; rejectDone = reject; });
+            void done.catch(() => {});
+            activeDeadline = setTimeout(() => { const error = new Error("Search exceeded the 10 second job limit"); rejectAck?.(error); rejectDone?.(error); }, WORKER_TIMEOUT);
+            worker!.postMessage({ type: "start", jobId, query, fileId: file.id, name: file.name });
+            let chunks = 0;
+            for (let offset = 0; offset < file.bytes.length; offset += 256 * 1024) {
+              await new Promise<void>((resolve, reject) => {
+                resolveAck = resolve; expectedAck = chunks;
+                // The per-file deadline also bounds a lost acknowledgment.
+                rejectAck = reject;
+                const bytes = file.bytes.slice(offset, Math.min(file.bytes.length, offset + 256 * 1024));
+                worker!.postMessage({ type: "chunk", jobId, sequence: chunks, offset, bytes }, [bytes.buffer]);
+              });
+              rejectAck = undefined;
+              chunks++;
+            }
+            worker!.postMessage({ type: "finish", jobId, chunks, byteLength: file.bytes.length });
+            all.push(...await done);
+            clearTimeout(activeDeadline); activeDeadline = undefined;
+          }
+          if (all.length >= 500) setError("Search reached the 500 result display limit.");
+          setMatches(all.slice(0, 500)); setSearching(false);
+          worker?.terminate();
+        } catch (error) {
+          clearTimeout(activeDeadline);
+          setError(`${String(error)}. Refine the query; completed file results are preserved.`);
+          setMatches(all); setSearching(false); worker?.terminate();
+        }
       };
-      worker.postMessage({
-        query,
-        files: project.files.map(({ id, name, bytes }) => ({
-          id,
-          name,
-          bytes,
-        })),
-      });
+      void run();
     }, 250);
     return () => {
       clearTimeout(timer);
-      clearTimeout(deadline);
       worker?.terminate();
     };
   }, [query, project.files]);
 
   function navigate(loc: Location, item?: Item) {
+    setMode("Inspect");
     const target = current.current.files.find((f) => f.id === loc.fileId);
     if (!target) return;
     setSelected(target.id);
+    setOpenTabs((tabs) => tabs.includes(target.id) ? tabs : [...tabs, target.id]);
     setLocation({ ...loc });
     setHexPage(Math.floor(loc.start / 512));
     setJump(String(loc.start));
@@ -270,11 +406,116 @@ export function App() {
     } else setView(validText(target) ? "Original" : "Hex");
   }
   function selectFile(f: Evidence) {
+    setMode("Inspect");
     setSelected(f.id);
+    setOpenTabs((tabs) => tabs.includes(f.id) ? tabs : [...tabs, f.id]);
     setLocation({ fileId: f.id, start: 0, end: 0 });
     setView(validText(f) ? "Original" : "Hex");
     setHexPage(0);
     setWatLine(undefined);
+  }
+  function startBeautify() {
+    if (!file || file.bytes.length > 5 * 1024 * 1024 || beautifyWorker.current) return;
+    setError(""); setBeautifying(true);
+    const worker = new BeautifyWorker();
+    beautifyWorker.current = worker;
+    let resolveChunk: (() => void) | undefined;
+    let rejectChunk: ((error: Error) => void) | undefined;
+    let expectedChunk = -1;
+    beautifyTimeout.current = window.setTimeout(() => {
+      rejectChunk?.(new Error("Beautify exceeded the 10 second job limit."));
+      worker.terminate(); beautifyWorker.current = undefined; setBeautifying(false);
+      beautifyTimeout.current = undefined;
+      setError("Beautifying exceeded the 10 second job limit and was stopped.");
+    }, WORKER_TIMEOUT);
+    worker.onmessage = (event: MessageEvent) => {
+      if (event.data.type === "ack") {
+        if (event.data.sequence !== expectedChunk) { rejectChunk?.(new Error("Beautify worker returned an invalid chunk acknowledgment")); return; }
+        resolveChunk?.(); resolveChunk = undefined; rejectChunk = undefined; return;
+      }
+      if (beautifyTimeout.current) clearTimeout(beautifyTimeout.current); beautifyTimeout.current = undefined; worker.terminate(); beautifyWorker.current = undefined; setBeautifying(false);
+      if (event.data.type === "beautified") { setBeautified((values) => ({ ...values, [file.id]: event.data.formatted })); if (selected === file.id) setView("Beautified"); }
+      else setError(String(event.data.error || "Beautify failed."));
+    };
+    worker.onerror = () => { rejectChunk?.(new Error("Beautify worker failed")); if (beautifyTimeout.current) clearTimeout(beautifyTimeout.current); beautifyTimeout.current = undefined; worker.terminate(); beautifyWorker.current = undefined; setBeautifying(false); setError("Beautify worker failed. The imported original is unchanged."); };
+    const send = async () => {
+      try {
+        const { bytes: _bytes, result: _result, ...metadata } = file;
+        worker.postMessage({ type: "start", action: "beautify", file: metadata, byteLength: file.bytes.length });
+        let chunks = 0;
+        for (let offset = 0; offset < file.bytes.length; offset += 256 * 1024) {
+          await new Promise<void>((resolve, reject) => {
+            resolveChunk = resolve; rejectChunk = reject; expectedChunk = chunks;
+            const bytes = file.bytes.slice(offset, Math.min(file.bytes.length, offset + 256 * 1024));
+            worker.postMessage({ type: "chunk", sequence: chunks, offset, bytes }, [bytes.buffer]);
+          });
+          chunks++;
+        }
+        worker.postMessage({ type: "finish", chunks, byteLength: file.bytes.length });
+      } catch (error) {
+        if (beautifyTimeout.current) clearTimeout(beautifyTimeout.current); beautifyTimeout.current = undefined;
+        worker.terminate(); beautifyWorker.current = undefined; setBeautifying(false); setError(String(error));
+      }
+    };
+    void send();
+  }
+  function cancelBeautify() {
+    if (beautifyTimeout.current) clearTimeout(beautifyTimeout.current); beautifyTimeout.current = undefined; beautifyWorker.current?.terminate(); beautifyWorker.current = undefined; setBeautifying(false);
+  }
+  function startInteractivePreview(targetFile: Evidence) {
+    const related = dependencies(project.files).filter((resource) => resource.file.id === targetFile.id && resource.target).map((resource) => resource.target!.id);
+    try { related.push(...buildStaticPreview(project.files, targetFile).resourceIds); } catch { /* oversized pages can still use explicit VM execution */ }
+    setDebugHandoff({ entry: targetFile.name, files: [...new Set([targetFile.id, ...related])] });
+    setMode("Debug");
+  }
+  function selectWelcome() {
+    setMode("Inspect");
+    setSelected(WELCOME_TAB_ID);
+    setOpenTabs((tabs) => tabs.includes(WELCOME_TAB_ID) ? tabs : [...tabs, WELCOME_TAB_ID]);
+    setLocation(undefined);
+    setHexPage(0);
+    setWatLine(undefined);
+  }
+  function closeFileTab(id: string) {
+    const index = openTabs.indexOf(id);
+    if (index < 0) return;
+    const nextTabs = openTabs.filter((tabId) => tabId !== id);
+    setOpenTabs(nextTabs);
+    if (selected === id) {
+      const nextId = nextTabs[Math.min(index, nextTabs.length - 1)] || "";
+      setSelected(nextId);
+      setLocation(undefined);
+      setHexPage(0);
+      setWatLine(undefined);
+      const nextFile = current.current.files.find((candidate) => candidate.id === nextId);
+      if (nextFile) setView(validText(nextFile) ? "Original" : "Hex");
+    }
+  }
+  const runtimeActive = (project.sessions || []).some((session) =>
+    ["starting", "running", "paused"].includes(session.status),
+  );
+  const canDeleteEvidence = !busy && !runtimeActive;
+  function deleteEvidence(evidence: Evidence) {
+    if (!canDeleteEvidence) return;
+    const linkedNotes = project.notes.filter((note) => note.location.fileId === evidence.id).length;
+    const linkedDecodes = project.decodes.filter((decode) => decode.location.fileId === evidence.id).length;
+    if (!window.confirm(`Remove “${evidence.name}” from this WRET project? This also removes ${linkedNotes} linked note(s), ${linkedDecodes} decoding record(s), its analysis results, and its breakpoints. The original file on your device is not deleted.`)) return;
+    const index = openTabs.indexOf(evidence.id);
+    const nextTabs = openTabs.filter((id) => id !== evidence.id);
+    const removingActive = selected === evidence.id;
+    const nextId = nextTabs[Math.min(Math.max(index, 0), nextTabs.length - 1)] || "";
+    update((project) => removeProjectEvidence(project, evidence.id));
+    setJobs((items) => items.filter((job) => job.fileId !== evidence.id));
+    setOpenTabs(nextTabs);
+    if (removingActive) {
+      setSelected(nextId);
+      setLocation(undefined);
+      setHexPage(0);
+      setWatLine(undefined);
+      const nextFile = current.current.files.find((candidate) => candidate.id === nextId);
+      if (nextFile) setView(validText(nextFile) ? "Original" : "Hex");
+    }
+    setFileMenu(undefined);
   }
   function patchJob(id: string, patch: Partial<Job>) {
     setJobs((list) => list.map((j) => (j.id === id ? { ...j, ...patch } : j)));
@@ -366,15 +607,27 @@ export function App() {
           "Import rejected: project evidence must be 100 MiB or smaller.",
         );
       const added: Evidence[] = [];
+      const existingPaths = new Set(current.current.files.map((f) => f.name));
       for (const f of incoming) {
+        const name = evidencePath(f.webkitRelativePath || f.name);
+        if (existingPaths.has(name))
+          throw new Error(
+            `Duplicate evidence path: ${name}. Rename the file or start another project.`,
+          );
+        existingPaths.add(name);
         const bytes = new Uint8Array(await f.arrayBuffer());
         added.push({
           id: uid(),
-          name: f.name,
+          name,
           bytes,
           hash: await sha256(bytes),
           format: detectFormat(f.name, bytes),
         });
+      }
+      const embedded = embeddedSources([...current.current.files, ...added]);
+      for (const source of embedded) {
+        source.hash = await sha256(source.bytes);
+        added.push(source);
       }
       update((p) => ({ ...p, files: [...p.files, ...added] }));
       selectFile(added[0]);
@@ -412,13 +665,23 @@ export function App() {
     }
   }
   async function openArchive(upload?: File) {
+    if (
+      (current.current.sessions || []).some((s) =>
+        ["running", "starting", "paused"].includes(s.status),
+      )
+    ) {
+      setError(
+        "Stop the active debugging session before replacing this project.",
+      );
+      return;
+    }
     if (!upload || lock.current) return;
     lock.current = true;
     setBusy(true);
     setError("");
     try {
-      if (upload.size > 200 * 1024 * 1024)
-        throw new Error("Project archive exceeds 200 MiB.");
+      if (upload.size > 300 * 1024 * 1024)
+        throw new Error("Project archive exceeds 300 MiB.");
       const restored = await importProject(await upload.text());
       if (
         current.current.files.length &&
@@ -434,14 +697,79 @@ export function App() {
       setDecodeOrigin(undefined);
       setJobs([]);
       setQuery("");
+      const keepWelcome = openTabs.includes(WELCOME_TAB_ID);
+      setOpenTabs(keepWelcome ? [WELCOME_TAB_ID] : []);
       if (restored.files[0]) selectFile(restored.files[0]);
-      else setSelected("");
+      else {
+        setSelected(keepWelcome ? WELCOME_TAB_ID : "");
+      }
     } catch (e) {
       setError(`Could not open project: ${String(e)}`);
     } finally {
       lock.current = false;
       setBusy(false);
       if (archiveInput.current) archiveInput.current.value = "";
+    }
+  }
+  async function importHarFile(upload?: File) {
+    if (!upload || busy || lock.current) return;
+    setBusy(true);
+    setError("");
+    try {
+      const parsed = parseHar(await upload.text());
+      if ((current.current.sessions || []).length >= 100)
+        throw new Error("This project already has 100 runtime or imported capture sessions.");
+      const evidenceByPlaceholder = new Map<string, string>();
+      const capturedFiles: Evidence[] = [];
+      let available = PROJECT_LIMIT - current.current.files.reduce((sum, file) => sum + file.bytes.length, 0);
+      for (const resource of parsed.resources) {
+        const hash = await sha256(resource.bytes);
+        const existing = current.current.files.find((file) => file.hash === hash) || capturedFiles.find((file) => file.hash === hash);
+        if (existing) {
+          evidenceByPlaceholder.set(`har-resource:${resource.index}`, existing.id);
+          continue;
+        }
+        if (resource.bytes.length > FILE_LIMIT || resource.bytes.length > available || current.current.files.length + capturedFiles.length >= 1000)
+          continue;
+        let suffix = "bin";
+        try { suffix = new URL(resource.url).pathname.split("/").pop()?.match(/\.([a-zA-Z0-9]{1,8})$/)?.[1]?.toLowerCase() || "bin"; } catch { /* use a safe generic extension */ }
+        const name = `captures/har/${uid()}/${resource.index}.${suffix}`;
+        const file: Evidence = { id: uid(), name, format: detectFormat(name, resource.bytes), bytes: resource.bytes, hash, runtimeUrl: resource.url };
+        capturedFiles.push(file);
+        available -= file.bytes.length;
+        evidenceByPlaceholder.set(`har-resource:${resource.index}`, file.id);
+      }
+      const requests = parsed.requests.map((request) => {
+        const fileId = request.evidenceId ? evidenceByPlaceholder.get(request.evidenceId) : undefined;
+        return { ...request, evidenceId: fileId, truncated: request.truncated || Boolean(request.evidenceId && !fileId) };
+      });
+      const id = uid();
+      const sessionBytes = new TextEncoder().encode(JSON.stringify(requests)).length + capturedFiles.reduce((sum, file) => sum + file.bytes.length, 0);
+      if (sessionBytes > 50 * 1024 * 1024) throw new Error("HAR records exceed the 50 MiB session capture limit.");
+      const next: Project = {
+        ...current.current,
+        schema: 4,
+        files: [...current.current.files, ...capturedFiles],
+        sessions: [...(current.current.sessions || []), {
+          id,
+          createdAt: new Date().toISOString(),
+          target: `HAR capture: ${upload.name.slice(0, 500)}`,
+          status: "stopped",
+          approvals: [],
+          observations: [],
+          requests,
+          capturedBytes: sessionBytes,
+          truncated: parsed.truncated || requests.some((request) => request.truncated),
+        }],
+      };
+      validateProjectBudgets(next);
+      update(() => next);
+      setMode("Network");
+    } catch (e) {
+      setError(`Could not import HAR: ${String(e)}`);
+    } finally {
+      setBusy(false);
+      if (harInput.current) harInput.current.value = "";
     }
   }
   async function exportArchive() {
@@ -457,6 +785,16 @@ export function App() {
   }
   function startNew() {
     if (
+      (current.current.sessions || []).some((s) =>
+        ["running", "starting", "paused"].includes(s.status),
+      )
+    ) {
+      setError(
+        "Stop the active debugging session before starting another project.",
+      );
+      return;
+    }
+    if (
       lock.current ||
       !window.confirm(
         "Start a new investigation? Export the current project first if you need to keep it.",
@@ -469,11 +807,14 @@ export function App() {
     setDecodeOrigin(undefined);
     current.current = fresh;
     setProject(fresh);
-    setSelected("");
+    setSelected(WELCOME_TAB_ID);
+    setOpenTabs([WELCOME_TAB_ID]);
+    setFileMenu(undefined);
     setLocation(undefined);
     setJobs([]);
     setQuery("");
     setError("");
+    setMode("Overview");
   }
   function addNote() {
     if (!file || !noteText.trim()) return;
@@ -497,7 +838,7 @@ export function App() {
     if (saved) setNoteText("");
     setPanel("Notes");
   }
-  function decode() {
+  async function decode() {
     if (!file) return;
     if (project.decodes.length >= 1000) {
       setError(
@@ -506,14 +847,22 @@ export function App() {
       return;
     }
     try {
-      const output = decodeValue(operation, decodeInput);
+      const decoded = await runResearchJob<{ output: string; bytes?: Uint8Array }>({ action: "decode", operation, input: decodeInput });
+      const binaryOutput = decoded.bytes;
+      const output = decoded.output;
       const loc =
         decodeOrigin ||
         (location?.fileId === file.id
           ? location
           : { fileId: file.id, start: 0, end: 0 });
+      const parent = decodeOrigin ? project.files.find((candidate) => candidate.id === decodeOrigin.fileId) : undefined;
+      const parentHash = parent ? parent.hash || await sha256(parent.bytes) : undefined;
+      const derived = binaryOutput && parent ? { id: uid(), bytes: binaryOutput, hash: await sha256(binaryOutput), name: `derived/${uid()}/${parent.name.split("/").pop()}.decompressed`, format: detectFormat(parent.name, binaryOutput), parent, parentHash: parentHash!, loc } : undefined;
+      if (derived && (project.files.length >= 1000 || project.files.reduce((sum, evidence) => sum + evidence.bytes.length, 0) + derived.bytes.length > PROJECT_LIMIT || (project.transformations || []).length >= 5000)) throw new Error("Derived evidence exceeds the project file, byte, or lineage limit.");
       const saved = annotate((p) => ({
         ...p,
+        files: derived ? [...p.files, { id: derived.id, name: derived.name, bytes: derived.bytes, hash: derived.hash, format: derived.format, derivation: { sourceId: derived.parent.id, sourceHash: derived.parentHash, recipe: operation, createdAt: new Date().toISOString(), changes: 1 } }] : p.files,
+        transformations: derived ? [...(p.transformations || []), { id: uid(), parentEvidenceId: derived.parent.id, parentHash: derived.parentHash, inputRange: { start: loc.start, end: loc.end }, operation, version: 1 as const, parameters: {}, createdAt: new Date().toISOString(), outputEvidenceId: derived.id, outputHash: derived.hash, mapping: "unknown" as const }] : p.transformations,
         decodes: [
           ...p.decodes,
           {
@@ -591,6 +940,114 @@ export function App() {
     );
   };
 
+  const commands: PaletteCommand[] = [
+    ...(["Overview", "Inspect", "Network", "Research", "Debug", "Report"] as const).map((section) => ({
+      id: `go-${section.toLowerCase()}`,
+      label: `Go to ${section}`,
+      description: {
+        Overview: "Review this investigation and suggested next steps.",
+        Inspect: "Browse evidence, static analysis, notes, and decoding tools.",
+        Network: "Search captured website requests, timing, headers, and response evidence.",
+        Research: "Preview AST transforms, follow workspace references, and inspect observed API shapes.",
+        Debug: "Run evidence in the companion VM and inspect its behavior.",
+        Report: "Review and export retained findings and observations.",
+      }[section],
+      keywords: `navigate ${section.toLowerCase()} view workspace`,
+      run: () => setMode(section),
+    })),
+    ...(file?.format === "html" ? [{ id: "render-selected", label: "Render selected HTML", description: "Open the sandboxed offline preview or choose an interactive VM preview.", keywords: "preview render html page browser", run: () => { setMode("Inspect"); setView("Render"); } }] : []),
+    ...(file && ["html", "javascript", "css", "json", "sourcemap"].includes(file.format) ? [{ id: "beautify-selected", label: "Beautify selected evidence", description: "Create a formatted view in a worker while preserving the imported bytes.", keywords: "format prettify beautified source", disabledReason: beautifying ? "Beautify is already in progress." : file.bytes.length > 5 * 1024 * 1024 ? "Beautify supports sources up to 5 MiB." : undefined, run: () => { setMode("Inspect"); startBeautify(); } }] : []),
+    {
+      id: "open-welcome",
+      label: "Open or show Welcome tab",
+      description: "Open the WRET Welcome page or switch to it if it is already open.",
+      keywords: "home start getting started welcome page",
+      run: selectWelcome,
+    },
+    {
+      id: "import-files", label: "Import files", description: "Add one or more files to the current investigation.",
+      keywords: "evidence upload add file",
+      disabledReason: busy || !ready ? "Wait for the current operation to finish." : undefined,
+      run: () => filesInput.current?.click(),
+    },
+    {
+      id: "import-folder", label: "Import site folder", description: "Import a website folder and preserve its relative paths.",
+      keywords: "directory website folder dependencies",
+      disabledReason: busy || !ready ? "Wait for the current operation to finish." : undefined,
+      run: () => folderInput.current?.click(),
+    },
+    {
+      id: "import-har", label: "Import HAR capture", description: "Import browser request history and bounded response bodies for offline review. Recorded URLs are not contacted.",
+      keywords: "network capture archive har waterfall offline",
+      disabledReason: busy || !ready ? "Wait for the current operation to finish." : undefined,
+      run: () => harInput.current?.click(),
+    },
+    {
+      id: "open-project", label: "Open project", description: "Open a previously exported WRET project archive.",
+      keywords: "archive restore load project",
+      disabledReason: busy || !ready ? "Wait for the current operation to finish." : undefined,
+      run: () => archiveInput.current?.click(),
+    },
+    {
+      id: "export-project", label: "Export project", description: "Download the project with its evidence, notes, and findings.",
+      keywords: "save backup archive portable project",
+      disabledReason: !ready ? "The project is still loading." : undefined,
+      run: () => void exportArchive(),
+    },
+    {
+      id: "export-report", label: "Export report", description: "Download a Markdown report of this investigation.",
+      keywords: "markdown findings report download",
+      disabledReason: !ready ? "The project is still loading." : undefined,
+      run: () => download("wret-report.md", report(project), "text/markdown"),
+    },
+    {
+      id: "new-project", label: "New project", description: "Start a new investigation after confirming the current project can be replaced.",
+      keywords: "clear reset investigation",
+      disabledReason: busy || !ready ? "Wait for the current operation to finish." : runtimeActive ? "Stop the active debugging session first." : undefined,
+      run: startNew,
+    },
+    {
+      id: "close-file", label: "Close active evidence tab", description: "Close the current editor tab and keep its evidence in the project.",
+      keywords: "close tab editor file",
+      disabledReason: !selected ? "No evidence tab is open." : undefined,
+      run: () => closeFileTab(selected),
+    },
+  ];
+  const closeTabCommand = commands.find((command) => command.id === "close-file");
+  if (closeTabCommand && selected === WELCOME_TAB_ID) {
+    closeTabCommand.label = "Close Welcome tab";
+    closeTabCommand.description = "Close the Welcome tab; it can be reopened from this palette.";
+    closeTabCommand.keywords += " welcome";
+  }
+  const filteredCommands = commands.filter((command) =>
+    `${command.label} ${command.description} ${command.keywords}`
+      .toLocaleLowerCase()
+      .includes(paletteQuery.trim().toLocaleLowerCase()),
+  );
+  const firstEnabledCommand = filteredCommands.findIndex((command) => !command.disabledReason);
+  const selectedIndex = filteredCommands[activeCommand]?.disabledReason
+    ? firstEnabledCommand
+    : filteredCommands[activeCommand] ? activeCommand : firstEnabledCommand;
+  const selectedCommand = selectedIndex >= 0 ? filteredCommands[selectedIndex] : undefined;
+  useEffect(() => {
+    if (!palette || !selectedCommand) return;
+    document.getElementById(`command-option-${selectedCommand.id}`)?.scrollIntoView({ block: "nearest" });
+  }, [palette, selectedCommand?.id]);
+  function moveCommandSelection(direction: -1 | 1) {
+    const enabled = filteredCommands.flatMap((command, index) => command.disabledReason ? [] : [index]);
+    if (!enabled.length) return;
+    const currentIndex = enabled.indexOf(activeCommand);
+    const nextIndex = currentIndex < 0
+      ? (direction > 0 ? 0 : enabled.length - 1)
+      : (currentIndex + direction + enabled.length) % enabled.length;
+    setActiveCommand(enabled[nextIndex]);
+  }
+  function runPaletteCommand(command?: PaletteCommand) {
+    if (!command || command.disabledReason) return;
+    command.run();
+    closePalette();
+  }
+
   return (
     <div
       className="app"
@@ -602,14 +1059,22 @@ export function App() {
         if (e.dataTransfer.files.length) void importFiles(e.dataTransfer.files);
       }}
     >
+      <GlobalTooltips />
       <header className="topbar">
         <div className="brand">
-          <span className="brand-mark">W</span>
-          <strong>WRET</strong>
-          <span className="brand-caption">ANALYSIS WORKBENCH</span>
-        </div>
-        <div className="privacy-badge">
-          <span className="status-dot" /> LOCAL ONLY
+          <button
+            className="brand-home"
+            type="button"
+            aria-label="WRET home — open Welcome"
+            title="Go to Welcome"
+            onClick={selectWelcome}
+          >
+            <span className="brand-logo-crop" aria-hidden="true">
+              <img src={wretLogoUrl} alt="" />
+            </span>
+            <strong>WRET</strong>
+          </button>
+          <span className="brand-caption">Web-based Reverse Engineering Tool</span>
         </div>
         <div className="header-actions">
           <button
@@ -630,6 +1095,97 @@ export function App() {
           </button>
         </div>
       </header>
+      <nav className="workflow-nav" aria-label="Investigation workflow">
+        {(["Overview", "Inspect", "Network", "Research", "Debug", "Report"] as const).map((value) => (
+          <Tooltip key={value} content={{Overview:"Project summary and suggested next steps.",Inspect:"Browse evidence, analysis results, notes, and decoding tools.",Network:"Search captured requests and open their response evidence.",Research:"Preview transformations, inspect cross-references, and review observed API shapes.",Debug:"Run selected evidence in the companion VM and inspect behavior.",Report:"Review and export investigation findings."}[value]}><button
+            key={value}
+            className={mode === value ? "active" : ""}
+            aria-current={mode === value ? "page" : undefined}
+            onClick={() => setMode(value)}
+          >
+            {value}
+          </button></Tooltip>
+        ))}
+        <Tooltip content="Search and run workbench commands. Shortcut: Ctrl+K."><button onClick={openPalette}>Commands · Ctrl+K</button></Tooltip>
+        <button
+          disabled={busy || !ready}
+          onClick={() => folderInput.current?.click()}
+          title="Import a website folder with relative paths. Choose an entrypoint before running it."
+        >
+          Import site folder
+        </button>
+      </nav>
+      {palette && (
+        <div className="command-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget) closePalette(); }}>
+          <section className="command-overlay" role="dialog" aria-modal="true" aria-label="Command palette" onMouseDown={(event) => event.stopPropagation()} onKeyDown={(event) => {
+            if (event.key !== "Tab") return;
+            const focusable = Array.from(event.currentTarget.querySelectorAll<HTMLElement>("input:not([disabled]), button:not([disabled])"));
+            if (!focusable.length) return;
+            const currentIndex = focusable.indexOf(document.activeElement as HTMLElement);
+            const nextIndex = event.shiftKey
+              ? (currentIndex <= 0 ? focusable.length - 1 : currentIndex - 1)
+              : (currentIndex < 0 || currentIndex === focusable.length - 1 ? 0 : currentIndex + 1);
+            event.preventDefault();
+            focusable[nextIndex].focus();
+          }}>
+            <div className="command-heading">
+              <div><h2>Command palette</h2><p>Search and run a WRET command</p></div>
+              <button className="command-close" aria-label="Close command palette" title="Close · Escape" onClick={closePalette}>×</button>
+            </div>
+            <input
+              ref={commandInput}
+              className="command-search"
+              type="text"
+              role="combobox"
+              aria-label="Search commands"
+              aria-autocomplete="list"
+              aria-expanded="true"
+              aria-controls="wret-command-list"
+              aria-activedescendant={selectedCommand ? `command-option-${selectedCommand.id}` : undefined}
+              placeholder="Type a command name…"
+              value={paletteQuery}
+              onChange={(event) => { setPaletteQuery(event.target.value); setActiveCommand(0); }}
+              onKeyDown={(event) => {
+                if (event.key === "ArrowDown") { event.preventDefault(); moveCommandSelection(1); }
+                else if (event.key === "ArrowUp") { event.preventDefault(); moveCommandSelection(-1); }
+                else if (event.key === "Enter") { event.preventDefault(); runPaletteCommand(selectedCommand); }
+              }}
+            />
+            <div className="command-list" id="wret-command-list" role="listbox" aria-label="Matching commands">
+              {filteredCommands.length ? filteredCommands.map((command, index) => (
+                <div
+                  key={command.id}
+                  id={`command-option-${command.id}`}
+                  role="option"
+                  aria-selected={selectedIndex === index}
+                  aria-disabled={Boolean(command.disabledReason)}
+                  className={`command-option ${selectedIndex === index ? "active" : ""} ${command.disabledReason ? "disabled" : ""}`}
+                  onMouseMove={() => { if (!command.disabledReason) setActiveCommand(index); }}
+                  onMouseDown={(event) => event.preventDefault()}
+                  onClick={() => runPaletteCommand(command)}
+                  title={command.disabledReason || command.description}
+                >
+                  <span className="command-option-copy"><strong>{command.label}</strong><small>{command.disabledReason || command.description}</small></span>
+                  {command.shortcut && <kbd>{command.shortcut}</kbd>}
+                </div>
+              )) : <p className="command-empty">No commands match “{paletteQuery}”. Try a section name or action such as “import”.</p>}
+            </div>
+            <div className="command-hint"><span><kbd>↑</kbd><kbd>↓</kbd> Navigate</span><span><kbd>Enter</kbd> Run</span><span><kbd>Esc</kbd> Close</span></div>
+          </section>
+        </div>
+      )}
+      <input
+        ref={folderInput}
+        type="file"
+        multiple
+        {...{ webkitdirectory: "" }}
+        className="hidden"
+        aria-label="Import site folder"
+        onChange={(e) => {
+          if (e.target.files) void importFiles(e.target.files);
+          e.target.value = "";
+        }}
+      />
       <input
         ref={filesInput}
         type="file"
@@ -637,6 +1193,14 @@ export function App() {
         className="hidden"
         aria-label="Import evidence files"
         onChange={(e) => e.target.files && void importFiles(e.target.files)}
+      />
+      <input
+        ref={harInput}
+        type="file"
+        accept=".har,application/json,application/har+json"
+        className="hidden"
+        aria-label="Import HAR capture"
+        onChange={(event) => { if (event.target.files?.[0]) void importHarFile(event.target.files[0]); }}
       />
       <input
         ref={archiveInput}
@@ -691,7 +1255,140 @@ export function App() {
           </button>
         </div>
       )}
-      <main className="workbench">
+      {mode === "Overview" && (
+        <section className="guided-overview">
+          <div className="section-kicker">YOUR INVESTIGATION WORKSPACE</div>
+          <h1>WRET: Web-based Reverse Engineering Tool</h1>
+          <p>
+            A browser-based tool for inspecting web files and debugging their behavior.
+          </p>
+          <div className="debug-toolbar">
+            <button
+              className="primary"
+              disabled={busy || !ready}
+              onClick={() => filesInput.current?.click()}
+            >
+              Import evidence files
+            </button>
+            <button
+              disabled={busy || !ready}
+              onClick={() => folderInput.current?.click()}
+            >
+              Import site folder
+            </button>
+            <button onClick={() => archiveInput.current?.click()}>
+              Open saved project
+            </button>
+            <button onClick={() => setMode("Debug")}>
+              Investigate a website URL
+            </button>
+          </div>
+          <div className="overview-cards">
+            <article>
+              <h2>{project.files.length} evidence files</h2>
+              <p>{size(totalBytes)} · original bytes retained</p>
+            </article>
+            <article>
+              <h2>{findings} findings</h2>
+              <p>Observable patterns with navigable evidence</p>
+            </article>
+            <article>
+              <h2>{project.sessions?.length || 0} runtime sessions</h2>
+              <p>Captured observations saved locally</p>
+            </article>
+          </div>
+          <h2>Suggested next steps</h2>
+          {project.files.slice(0, 30).map((f) => (
+            <p key={f.id}>
+              <button onClick={() => selectFile(f)}>Inspect {f.name}</button> ·{" "}
+              {f.result
+                ? `${f.result.outline.length} functions, ${f.result.findings.length} findings`
+                : "Analysis pending"}
+              {f.result?.diagnostics.map((d, i) => (
+                <span className="diagnostic-line" key={i}>
+                  {d}
+                </span>
+              ))}
+            </p>
+          ))}
+          <h2>Imported website dependencies</h2>
+          {resources.map((resource, index) => (
+            <p key={index}>
+              {resource.file.name} → {resource.reference} ·{" "}
+              {resource.target ? (
+                <button onClick={() => selectFile(resource.target!)}>
+                  Inspect resource
+                </button>
+              ) : resource.external ? (
+                "External resource; not fetched"
+              ) : (
+                "Missing imported dependency"
+              )}
+            </p>
+          ))}
+          <details>
+            <summary>Workflow help</summary>
+            <p>
+              Inspect shows original source, hex, symbols, findings, maps, and
+              reversible decoding. Debug requires the Windows local companion
+              and a prepared VM. Report exports your findings and captured
+              observations. Ctrl+K opens commands.
+            </p>
+          </details>
+        </section>
+      )}
+      <DebugPanel
+        active={mode === "Debug"}
+        initialEntry={debugHandoff?.entry}
+        initialSelection={debugHandoff?.files}
+        project={project}
+        update={update}
+        onNavigate={(f, start = 0) =>
+          navigate({ fileId: f.id, start, end: start })
+        }
+      />
+      {mode === "Network" && <NetworkView
+        sessions={project.sessions || []}
+        files={project.files}
+        onOpenEvidence={selectFile}
+        onImportHar={() => harInput.current?.click()}
+      />}
+      {mode === "Research" && <ResearchView project={project} selection={location} update={update} navigate={navigate} />}
+      {mode === "Report" && (
+        <section className="guided-overview">
+          <h1>Investigation report</h1>
+          <div className="debug-toolbar">
+            <button
+              onClick={() =>
+                download("wret-report.md", report(project), "text/markdown")
+              }
+            >
+              Export Markdown report
+            </button>
+            <button onClick={() => void exportArchive()}>
+              Export portable project
+            </button>
+          </div>
+          <p>
+            Preview shows up to 100 notes and 20 observations per session.
+            Export includes all retained records.
+          </p>
+          <pre>
+            {report({
+              ...project,
+              notes: project.notes.slice(0, 100),
+              sessions: project.sessions?.map((s) => ({
+                ...s,
+                observations: s.observations.slice(-20),
+              })),
+            }).slice(0, 100000)}
+          </pre>
+        </section>
+      )}
+      <main
+        className="workbench"
+        style={mode === "Inspect" ? undefined : { display: "none" }}
+      >
         <aside className="explorer">
           <div className="pane-heading">
             <span>PROJECT EXPLORER</span>
@@ -700,27 +1397,27 @@ export function App() {
           <div className="explorer-files">
             {project.files.length ? (
               project.files.map((f) => (
-                <button
+                <div
                   key={f.id}
                   className={`file-row ${selected === f.id ? "selected" : ""}`}
-                  onClick={() => selectFile(f)}
+                  onContextMenu={(event) => { event.preventDefault(); setFileMenu({ id:f.id, x:Math.min(event.clientX, window.innerWidth - 210), y:Math.min(event.clientY, window.innerHeight - 120) }); }}
                 >
-                  <span className={`file-icon ${f.format}`}>
-                    {f.format === "javascript"
-                      ? "JS"
-                      : f.format === "wasm"
-                        ? "WA"
-                        : "{ }"}
+                  <button className="file-open-action" onClick={() => selectFile(f)} onKeyDown={(event) => {
+                    if (event.key === "ContextMenu" || (event.shiftKey && event.key === "F10")) { event.preventDefault(); const rect = event.currentTarget.getBoundingClientRect(); setFileMenu({ id:f.id, x:Math.min(rect.left, window.innerWidth - 210), y:Math.min(rect.bottom, window.innerHeight - 120) }); }
+                  }} aria-label={`Inspect ${f.name}`} title={`Open ${f.name} in the evidence editor.`}>
+                    <span className={`file-icon ${f.format}`}>
+                      {f.format === "javascript" ? "JS" : f.format === "wasm" ? "WA" : "{ }"}
+                    </span>
+                    <span className="file-label">
+                      {f.name}
+                      <small>{size(f.bytes.length)}</small>
+                    </span>
+                    <span className={`file-state ${f.result ? "analyzed" : ""}`} title={f.result ? "Analyzed" : "Awaiting analysis"} />
+                  </button>
+                  <span className="file-row-actions">
+                    <Tooltip content={canDeleteEvidence ? `Delete ${f.name} and its linked project records. The original file on your device is untouched.` : "Wait for analysis to finish and stop active runtime sessions before deleting evidence."}><button type="button" className="file-row-delete" title={canDeleteEvidence ? `Delete ${f.name} from this project` : "Stop analysis and active runtime sessions before deleting evidence"} aria-label={`Delete ${f.name}`} disabled={!canDeleteEvidence} onClick={(event) => { event.stopPropagation(); deleteEvidence(f); }}>×</button></Tooltip>
                   </span>
-                  <span className="file-label">
-                    {f.name}
-                    <small>{size(f.bytes.length)}</small>
-                  </span>
-                  <span
-                    className={`file-state ${f.result ? "analyzed" : ""}`}
-                    title={f.result ? "Analyzed" : "Awaiting analysis"}
-                  />
-                </button>
+                </div>
               ))
             ) : (
               <div className="explorer-empty">
@@ -749,17 +1446,38 @@ export function App() {
             </span>
           </div>
         </aside>
+        {fileMenu && (() => {
+          const menuFile = project.files.find((candidate) => candidate.id === fileMenu.id);
+          if (!menuFile) return null;
+          return <div className="file-menu-dismiss" onMouseDown={() => setFileMenu(undefined)}>
+            <div className="file-context-menu" role="menu" style={{ left:fileMenu.x, top:fileMenu.y }} onMouseDown={(event) => event.stopPropagation()}>
+              <button role="menuitem" onClick={() => { selectFile(menuFile); setFileMenu(undefined); }}>Inspect <span>{menuFile.name}</span></button>
+              <Tooltip content={!canDeleteEvidence ? "Wait for analysis to finish and stop active runtime sessions before deleting evidence." : "Remove this evidence and its linked records from this project. The original file on your device is untouched."}><button role="menuitem" disabled={!canDeleteEvidence} title={!canDeleteEvidence ? "Stop analysis and active runtime sessions before deleting evidence" : "Remove this evidence and its linked records from the project"} onClick={() => deleteEvidence(menuFile)}>Delete <span>{menuFile.name}</span></button></Tooltip>
+            </div>
+          </div>;
+        })()}
         <section className="center-pane">
           <div className="file-tabbar">
-            <span className="active-file">
-              {file ? (
-                <>
-                  <span className="teal">◇</span> {file.name}
-                </>
-              ) : (
-                "Investigation overview"
-              )}
-            </span>
+            <div className="evidence-tabs" role="tablist" aria-label="Open editor tabs">
+              {openTabs.map((id) => {
+                if (id === WELCOME_TAB_ID) {
+                  return <div className={`evidence-tab welcome-tab ${selected === id ? "active" : ""}`} key={id}>
+                    <button role="tab" aria-selected={selected === id} aria-label="Welcome" title="Switch to Welcome" onClick={selectWelcome}>
+                      <span className="teal">⌂</span><span className="evidence-tab-name">Welcome</span>
+                    </button>
+                    <button className="evidence-tab-close" aria-label="Close Welcome tab" title="Close Welcome tab; reopen it from Commands · Ctrl+K" onClick={() => closeFileTab(WELCOME_TAB_ID)}>×</button>
+                  </div>;
+                }
+                const tabFile = project.files.find((candidate) => candidate.id === id);
+                if (!tabFile) return null;
+                return <div className={`evidence-tab ${selected === id ? "active" : ""}`} key={id}>
+                  <button role="tab" aria-selected={selected === id} aria-label={`Inspect ${tabFile.name}`} title={`Switch to ${tabFile.name}`} onClick={() => selectFile(tabFile)}>
+                    <span className="teal">◇</span><span className="evidence-tab-name">{tabFile.name}</span>
+                  </button>
+                  <button className="evidence-tab-close" aria-label={`Close ${tabFile.name}`} title={`Close ${tabFile.name} tab; keep it in the project`} onClick={() => closeFileTab(id)}>×</button>
+                </div>;
+              })}
+            </div>
             {file && (
               <span className="file-format">
                 {file.format.toUpperCase()} · {size(file.bytes.length)}
@@ -777,30 +1495,33 @@ export function App() {
                   [
                     "Original",
                     "Hex",
-                    "Formatted",
+                    "Beautified",
                     "AST",
                     "WAT",
                     "Graph",
                     "Decode",
+                    ...(file.format === "html" ? ["Render" as View] : []),
                   ] as View[]
                 ).map((v) => (
-                  <button
-                    key={v}
+                  <Tooltip key={v} content={{Original:"View the imported source. Click the editor gutter to set or clear a breakpoint.",Hex:"Inspect the original bytes and select byte ranges.",Beautified:"Read a formatted copy; its positions do not map exactly to original evidence.",AST:"Browse the parsed syntax tree and jump to source locations.",WAT:"Read the WebAssembly text representation and navigate its sections.",Graph:"Explore links between files, functions, calls, and findings.",Decode:"Apply reversible decoding steps while retaining the original evidence.",Render:"Build an offline sandboxed HTML preview with scripts disabled."}[v]}><button
                     role="tab"
                     aria-selected={view === v}
                     className={view === v ? "active" : ""}
+                    title={v === "Beautified" && !beautified[file.id] && !result?.formatted ? "Select Beautify to create this view." : undefined}
                     disabled={
                       (v === "Original" && originalText === undefined) ||
-                      (v === "Formatted" && !result?.formatted) ||
+                      (v === "Beautified" && !beautified[file.id] && !result?.formatted) ||
                       (v === "AST" && !result?.ast) ||
                       (v === "WAT" && !result?.wat)
                     }
                     onClick={() => setView(v)}
                   >
                     {v}
-                  </button>
+                  </button></Tooltip>
                 ))}
               </div>
+              <div className="view-actions"><Tooltip content="Format HTML, JavaScript, CSS, JSON, or a source map in a worker. Original evidence stays unchanged."><button onClick={startBeautify} disabled={beautifying || file.bytes.length > 5 * 1024 * 1024 || !["html", "javascript", "css", "json", "sourcemap"].includes(file.format)} title={beautifying ? "Beautifying is already in progress." : file.bytes.length > 5 * 1024 * 1024 ? "Beautify supports sources up to 5 MiB." : !["html", "javascript", "css", "json", "sourcemap"].includes(file.format) ? "This evidence format is not supported by Beautify." : "Create a formatted view; original evidence stays unchanged."}>{beautifying ? "Beautifying…" : "Beautify"}</button></Tooltip>
+                {beautifying && <button onClick={cancelBeautify} aria-label="Cancel beautifying">Cancel</button>}</div>
               <div className="view-content">
                 {view === "Original" && originalText !== undefined && (
                   <Editor
@@ -809,22 +1530,63 @@ export function App() {
                     original
                     location={location}
                     onSelection={setLocation}
+                    breakpointLines={(project.breakpoints || [])
+                      .filter(
+                        (bp) =>
+                          bp.url ===
+                          (file.runtimeUrl ||
+                            "http://127.0.0.1:8765/" + file.name),
+                      )
+                      .map((bp) => bp.line)}
+                    onBreakpoint={(line) => {
+                      const url =
+                        file.runtimeUrl || "http://127.0.0.1:8765/" + file.name;
+                      const existing = current.current.breakpoints?.find(
+                        (bp) => bp.url === url && bp.line === line,
+                      );
+                      const breakpoint = {
+                        id: uid(),
+                        url,
+                        line,
+                        condition: "",
+                      };
+                      update((p) => ({
+                        ...p,
+                        breakpoints: existing
+                          ? (p.breakpoints || []).filter(
+                              (bp) => bp.id !== existing.id,
+                            )
+                          : [...(p.breakpoints || []), breakpoint],
+                      }));
+                      window.dispatchEvent(
+                        new CustomEvent("wret-debug-command", {
+                          detail: existing
+                            ? { action: "removeBreakpoint", id: existing.id }
+                            : { action: "breakpoint", breakpoint },
+                        }),
+                      );
+                    }}
                   />
                 )}
-                {view === "Formatted" && (
+                {view === "Beautified" && (
                   <>
                     <div className="view-help">
                       Derived formatting · original bytes are preserved. No
                       exact source map is available; annotate the Original view.
                     </div>
+                    <div className="render-toolbar">
+                      <button aria-label="Copy beautified source" onClick={() => { try { void navigator.clipboard.writeText(beautified[file.id] || result?.formatted || "").then(() => setError("Beautified source copied."), () => setError("Clipboard access was denied.")); } catch { setError("Clipboard access is unavailable."); } }}>Copy beautified source</button>
+                      <button onClick={() => download(file.name.replace(/(\.[^./]+)$/, ".beautified$1"), beautified[file.id] || result?.formatted || "", "text/plain")}>Download beautified file</button>
+                    </div>
                     <Editor
                       file={file}
-                      value={result?.formatted || ""}
+                      value={beautified[file.id] || result?.formatted || ""}
                       original={false}
                       onSelection={() => {}}
                     />
                   </>
                 )}
+                {view === "Render" && file.format === "html" && <StaticRenderView files={project.files} file={file} onInteractive={() => startInteractivePreview(file)} />}
                 {view === "WAT" && (
                   <>
                     <div className="view-help">
@@ -1005,6 +1767,14 @@ export function App() {
                         }
                       >
                         <option value="base64">Base64 → text</option>
+                        <option value="strings">
+                          Fold constant string concatenation
+                        </option>
+                        <option value="nested">
+                          Decode nested encodings (up to 5 layers)
+                        </option>
+                        <option value="gzip">gzip decompress (Base64 input)</option>
+                        <option value="deflate">deflate decompress (Base64 input)</option>
                         <option value="hex">Hex → text</option>
                         <option value="url">URL → text</option>
                       </select>
@@ -1029,7 +1799,7 @@ export function App() {
                     <textarea
                       aria-label="Encoded input"
                       value={decodeInput}
-                      maxLength={1024 * 1024}
+                      maxLength={operation === "gzip" || operation === "deflate" ? 2 * 1024 * 1024 : 1024 * 1024}
                       onChange={(e) => {
                         setDecodeInput(e.target.value);
                         setDecodeOrigin(undefined);
@@ -1109,20 +1879,13 @@ export function App() {
                 </button>
               </div>
             </>
-          ) : (
+          ) : selected === WELCOME_TAB_ID ? (
             <div className="welcome">
               <div className="welcome-emblem">⌘</div>
-              <div className="section-kicker">
-                A LOCAL-FIRST INVESTIGATION SPACE
-              </div>
-              <h1>
-                Unfamiliar code.
-                <br />
-                <span>Understandable evidence.</span>
-              </h1>
+              <div className="section-kicker">WRET: Web-based Reverse Engineering Tool</div>
+              <h1>Inspect web files and debug their behavior.</h1>
               <p>
-                Inspect suspicious web files, trace relationships, and document
-                what you find. Your evidence never leaves this browser.
+                A browser-based tool for inspecting web files and debugging their behavior.
               </p>
               <button
                 className="primary large"
@@ -1158,6 +1921,15 @@ export function App() {
                 <span>JSON / source maps</span>
               </div>
             </div>
+          ) : (
+            <div className="inspect-empty">
+              <h2>No editor tab open</h2>
+              <p>Your evidence remains in Project Explorer. Open a file or restore the Welcome page.</p>
+              <div>
+                {project.files[0] && <button onClick={() => selectFile(project.files[0])}>Open first evidence file</button>}
+                <button onClick={selectWelcome}>Open Welcome</button>
+              </div>
+            </div>
           )}
         </section>
         <aside className="inspector">
@@ -1176,13 +1948,12 @@ export function App() {
                 "Sections",
               ] as Panel[]
             ).map((p) => (
-              <button
-                key={p}
+              <Tooltip key={p} content={{Findings:"Review analysis indicators and their source locations.",Symbols:"Browse functions, classes, and other parsed symbols.",Search:"Search across imported project evidence.",Notes:"Create and review annotations attached to evidence.",Strings:"Review strings extracted during static analysis.",Sections:"Inspect sections detected in WebAssembly evidence."}[p]}><button
                 className={panel === p ? "active" : ""}
                 onClick={() => setPanel(p)}
               >
                 {p}
-              </button>
+              </button></Tooltip>
             ))}
           </div>
           <div className="inspector-content">
@@ -1420,13 +2191,52 @@ export function App() {
           )}
         </aside>
       </main>
-      <section className="jobs-pane">
+      {mode === "Inspect" && file && (
+        <section className="source-map-panel">
+          <details>
+            <summary>
+              Local source map navigation · {mapping.mappings.length} mappings
+            </summary>
+            {mapping.diagnostics.map((d, i) => (
+              <p key={i}>{d}</p>
+            ))}
+            {mapping.mappings.slice(0, 100).map((m, i) => (
+              <button key={i} onClick={() => navigate(m.original)}>
+                Generated {m.line}:{m.column} → {m.source} byte{" "}
+                {m.original.start}
+              </button>
+            ))}
+            {mapping.mappings.length > 100 && (
+              <p>
+                First 100 mappings shown. Select a generated position and use
+                the nearest mapping below.
+              </p>
+            )}
+            <button
+              disabled={!mapping.mappings.length}
+              onClick={() => {
+                const byte = location?.fileId === file.id ? location.start : 0;
+                const nearest = [...mapping.mappings]
+                  .reverse()
+                  .find((m) => m.generated.start <= byte);
+                if (nearest) navigate(nearest.original);
+              }}
+            >
+              Navigate selected position to original source
+            </button>
+          </details>
+        </section>
+      )}
+      <section
+        className="jobs-pane"
+        style={mode === "Inspect" ? undefined : { display: "none" }}
+      >
         <div className="jobs-heading">
           <span>
             ANALYSIS JOBS <span className="counter">{jobs.length}</span>
           </span>
           <span className="jobs-hint">
-            Static analysis · workers terminate after 60 seconds
+            Static analysis jobs terminate after 10 seconds
           </span>
           {busy && (
             <button
@@ -1467,22 +2277,17 @@ export function App() {
             ))
           ) : (
             <p>
-              Ready to inspect. Imported files are analyzed in isolated worker
-              jobs; sample code is never executed.
+              Ready to inspect. Static analysis runs in workers. Dynamic
+              execution requires an explicitly started VM session.
             </p>
           )}
         </div>
       </section>
       <footer className="statusbar">
         <span>
-          <span className="status-dot" /> {storage}
-        </span>
-        <span>
           {project.tools[0]
             ? `${project.tools[0].id} v${project.tools[0].version}`
-            : "Tools load on demand"}{" "}
-          <span className="status-divider">/</span> No uploads · No external
-          services
+            : "Tools load on demand"}
         </span>
         <button
           onClick={() =>

@@ -1,5 +1,7 @@
 import { sha256, type Evidence, type Analysis, type ToolPin } from "./model";
-export const WORKER_TIMEOUT = 60000;
+// Sample controlled work always has a short wall clock budget. Network fetches
+// for the first party analyzer have separate deadlines below.
+export const WORKER_TIMEOUT = 10_000;
 export async function loadTool(signal?: AbortSignal): Promise<ToolPin> {
   const response = await fetch("/tools/manifest.json", {
     signal: signal
@@ -61,13 +63,20 @@ export async function runAnalysis(
       reject(error);
       return;
     }
+    let rejectAck: ((error: Error) => void) | undefined;
+    let expectedAck: number | undefined;
+    let cleaned = false;
     const cleanup = () => {
+      if (cleaned) return;
+      cleaned = true;
       clearTimeout(timer);
       worker.terminate();
       URL.revokeObjectURL(url);
       signal.removeEventListener("abort", abort);
     };
     const fail = (error: unknown) => {
+      rejectAck?.(error instanceof Error ? error : new Error(String(error)));
+      rejectAck = undefined;
       cleanup();
       reject(error);
     };
@@ -77,29 +86,43 @@ export async function runAnalysis(
       () =>
         fail(
           new Error(
-            "Analysis exceeded 60 seconds; worker terminated. Original evidence and notes are preserved.",
+            "Analysis exceeded the 10 second job limit; worker terminated. Original evidence and notes are preserved.",
           ),
         ),
-      timeout,
+      Math.min(timeout, WORKER_TIMEOUT),
     );
     signal.addEventListener("abort", abort, { once: true });
     worker.onerror = (e) => fail(new Error(`Worker failed: ${e.message}`));
     worker.onmessageerror = () =>
       fail(new Error("Worker returned an unreadable message"));
     worker.onmessage = (e) => {
-      if (e.data.type === "progress") onProgress(e.data.progress);
+      if (e.data.type === "ack") {
+        if (e.data.sequence !== expectedAck) return fail(new Error("Analysis worker returned an invalid chunk acknowledgment"));
+        rejectAck = undefined; acknowledge?.(); acknowledge = undefined;
+      }
+      else if (e.data.type === "progress") onProgress(e.data.progress);
       else if (e.data.type === "result") {
         cleanup();
         resolve(e.data.result);
       } else if (e.data.type === "error") fail(new Error(e.data.error));
     };
-    worker.postMessage({
-      file: {
-        id: file.id,
-        name: file.name,
-        bytes: file.bytes,
-        format: file.format,
-      },
-    });
+    let acknowledge: (() => void) | undefined;
+    const send = async () => {
+      try {
+        const { bytes: _bytes, result: _result, ...metadata } = file;
+        worker.postMessage({ type: "start", action: "analyze", file: metadata, byteLength: file.bytes.length });
+        let chunks = 0;
+        for (let offset = 0; offset < file.bytes.length; offset += 256 * 1024) {
+          await new Promise<void>((resolve, reject) => {
+            acknowledge = resolve; rejectAck = reject; expectedAck = chunks;
+            const bytes = file.bytes.slice(offset, Math.min(file.bytes.length, offset + 256 * 1024));
+            worker.postMessage({ type: "chunk", sequence: chunks, offset, bytes }, [bytes.buffer]);
+          });
+          chunks++;
+        }
+        worker.postMessage({ type: "finish", chunks, byteLength: file.bytes.length });
+      } catch (error) { fail(error); }
+    };
+    void send();
   });
 }

@@ -19,6 +19,7 @@ test("searches binary bytes and preserves exact selections across UTF-8 BOM and 
   await page.goto("/");
   const source =
     '\uFEFFconst a="é";\r\nconst b="🧭";\nfetch("https://example.invalid");\rconst c=3;';
+  await expect(page.getByRole("button", { name: "＋ Import files", exact: true })).toBeEnabled();
   await page.getByLabel("Import evidence files").setInputFiles([
     {
       name: "bom.js",

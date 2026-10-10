@@ -2,7 +2,13 @@
 
 ## Run the application
 
-The browser-only MVP is implemented in this repository. Start the Docker deployment:
+The **Research** workspace adds reviewed AST transformations, searchable lexical/module cross-references, observed API response shapes, and runtime snapshot comparison. Debug adds bounded state snapshots and explicit pause suppression. Original evidence is retained, and derived files record transformation provenance. See the [gap implementation plan](docs/GAP-IMPLEMENTATION.md) for limits and follow-up work. Current Chromium no longer supports CDP live script editing; WRET probes support and disables that action on unsupported builds.
+
+The guided workbench includes Overview, Inspect, Network, Debug, and Report workflows. Import HAR captures for offline request review; import never contacts the recorded URLs. Runtime sessions can capture approved requests and bounded response resources through the local companion. For local VM debugging, run `npm.cmd ci` and `npm.cmd run companion`, then open **http://127.0.0.1:8080**. QEMU, Windows Hypervisor Platform, and a prepared guest image are required; follow [Companion setup](docs/COMPANION.md). The Windows VM acceptance suite remains a required release check.
+
+Static inspection remains available using the Docker and development commands below. Dynamic sessions run only through the local companion. External WebSocket transport and advanced WASM runtime debugging are not supported in this implementation.
+
+For static inspection, start the Docker deployment:
 
 ```sh
 docker compose up --build -d
@@ -21,7 +27,7 @@ Validation: `npm test`, `npm run build`, then `npm run test:e2e` (install Playwr
 
 Import files, select a finding or symbol to navigate to original evidence, and use **Notes** to add comments, bookmarks or function labels. **Export project** writes a portable `.wret.json` archive; **Export report** writes Markdown. The browser retains the current project locally. Export it before starting a new project or changing browser/origin.
 
-See [Development and verification](docs/DEVELOPMENT.md) for the implementation map, tool protocol, resource limits, analysis limitations and test coverage. The original requirements and future roadmap follow below.
+See [Development and verification](docs/DEVELOPMENT.md) for the implementation map, tool protocol, resource limits, analysis limitations and test coverage. The original MVP requirements and roadmap below describe the static baseline; the companion additions and remaining limitations are documented above and in [Companion setup](docs/COMPANION.md).
 
 ## Summary
 
@@ -38,6 +44,7 @@ The Ghidra inspiration is the investigation workflow: navigate code, inspect byt
 - **JavaScript analysis:** formatting, syntax tree inspection, function outline, symbol references, and statically resolvable call relationships. Mark unresolved dynamic relationships explicitly.
 - **WebAssembly analysis:** section inspection, imports, exports, functions, and navigable WAT disassembly. Use browser-compatible WABT tooling; WAT is the initial representation rather than recovered high-level source. [WABT](https://github.com/WebAssembly/wabt)
 - **Investigation tools:** project-wide search, extracted URLs/domains, suspicious API usage, and a relationship graph connecting files, functions, and findings.
+- **Network investigations:** searchable request/status/timing views, request and response headers, initiator metadata, captured response evidence, and offline HAR import with body limits and credential redaction.
 - **Analyst notes:** comments, bookmarks, analyst-assigned function labels, and finding status. Preserve original evidence when creating formatted or decoded views.
 - **Reversible decoding:** Base64, hexadecimal, and URL decoding, with recorded input and transformation steps. Never execute decoded content.
 - **Export:** portable project archive and a Markdown report containing findings, notes, hashes, and evidence locations.
@@ -66,7 +73,7 @@ After the MVP, prioritize:
 
 - **Sample comparison:** compare code, strings, imports, and indicators across versions.
 - **Deobfuscation assistance:** bounded constant folding and string reconstruction with a visible transformation history.
-- **Capture import:** HAR files and saved website bundles, linking requests to code references.
+- **Capture import:** broader saved website bundles and richer request-to-source linking.
 - **Debugging:** a separate disposable-VM execution backend controlled through WRET, providing breakpoints, stepping, variables, and captured behavior. Define this boundary before implementing execution.
 - **Advanced analysis:** WASM control-flow graphs, decompiler research, local rule packs, and eventually constrained data-flow analysis.
 
@@ -81,4 +88,4 @@ Native PE/ELF analysis and general-purpose Ghidra parity remain outside this roa
 - Inspect network traffic to confirm sample bytes, extracted indicators, and notes never leave the browser.
 - Start with current desktop Chrome and Edge. Support multi-file import and WRET project archives; defer arbitrary archive extraction.
 - Set initial limits of **25 MiB per file and 100 MiB per project**, with clear rejection messages and adjustable limits after performance testing.
-- No live website browsing, sample execution, cloud AI, or automatic malware verdicts in the MVP.
+- No direct website browsing from the static workbench, cloud AI, or automatic malware verdicts. Dynamic execution runs explicitly in the disposable companion VM under its destination approval policy.

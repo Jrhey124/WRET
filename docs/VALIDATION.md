@@ -1,5 +1,16 @@
 # MVP validation record
 
+## Guided workbench and companion update — 2026-10-10
+
+- Production frontend build and companion TypeScript checks passed.
+- **41 unit/API tests passed**, including archive migration, local/embedded source maps, recipes, authentication/origin enforcement, DNS pinning, redirect approval boundaries, and response limits.
+- **12 browser tests passed in both Edge and Chrome**, covering the guided workspace, inert dependency parsing, static investigation, runtime observation ordering/replay, annotations, credential/handle sanitization, export, and reload recovery. Overview and Inspect screenshots were visually inspected.
+- A real Chromium guest protocol test passed in a network-disabled Linux container using only benign fixtures: breakpoints before execution, stepping, variable scopes, evaluation, workers, frames, captured scripts, browser preview, HTTP blocking, and WebSocket attempts.
+- **Windows QEMU acceptance is not complete.** The real VM test was run and failed at prerequisite checks because QEMU/qemu-img and the prepared guest image/checksum are absent. WHPX initialization, real guest boot, isolation, orphan cleanup, and disposable-disk lifecycle must be verified on a configured Windows host before a debugger release is declared complete.
+- The container protocol test uses a test-only stdio transport and disables Chromium's sandbox inside that test container. Production VM launches use virtio serial, no network adapter, an unprivileged guest service, and the Chromium sandbox. The container result does not establish VM containment.
+
+Follow [Companion setup](COMPANION.md) and run `npm.cmd run test:vm` after provisioning. The earlier static-MVP record below is retained as historical evidence.
+
 Verified on 2026-10-05 against the implemented README MVP. Future-roadmap items remain explicitly deferred.
 
 | Requirement | Implementation and verification |
