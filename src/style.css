@@ -1373,7 +1373,7 @@ input,select,textarea { background:#fff; color:#273139; border-color:#ccd3d7; }
 .brand-logo { display: block; width: 44px; height: 44px; flex: 0 0 44px; object-fit: contain; }
 .brand-name { font-size: 20px; font-weight: 750; letter-spacing: .04em; color: #202a30; }
 .brand-caption { margin-left: 5px; padding-left: 14px; border-left: 1px solid #d8dddf; }
-.welcome { justify-content: flex-start; min-height: 100%; overflow: auto; padding: clamp(14px, 3vh, 28px) clamp(14px, 3vw, 28px) 32px; }
+.welcome { flex: 1 1 0; min-height: 0; justify-content: flex-start; overflow: auto; overscroll-behavior: contain; padding: clamp(14px, 3vh, 28px) clamp(14px, 3vw, 28px) 32px; }
 .welcome-emblem { display: block; flex: 0 0 auto; width: min(144px, 28vw, 20vh); height: min(144px, 28vw, 20vh); min-width: 92px; min-height: 92px; object-fit: contain; margin: 0 0 12px; }
 .welcome .section-kicker { font-size: 11px; letter-spacing: .12em; line-height: 1.5; }
 .welcome h1 { margin: 8px 0; font-size: clamp(24px, 2.2vw, 32px); line-height: 1.2; letter-spacing: -.025em; }
