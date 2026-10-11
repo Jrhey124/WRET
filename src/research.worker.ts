@@ -1,7 +1,7 @@
 import { parseHar } from "./har";
 import { buildStaticPreview } from "./static-render";
 import { byteToOffset, type Evidence, type Item, type Location } from "./model";
-import { observedContracts, snapshotDifferences, transformJavaScript, workspaceReferences, type Recipe } from "./gap-analysis";
+import { deobfuscateJavaScript, observedContracts, snapshotDifferences, transformJavaScript, workspaceReferences, type DeobfuscationRecipe, type Recipe } from "./gap-analysis";
 import { decodeValue, decompressValue } from "./decoding";
 
 let stream: { id: string; options: any; files: Evidence[]; active?: { metadata: any; bytes: Uint8Array; offset: number }; sequence: number; total: number } | undefined;
@@ -56,6 +56,10 @@ self.onmessage = async (event: MessageEvent<any>) => {
       const selection = event.data.location as Location | undefined;
       const range = selection ? { start: byteToOffset(bytes, selection.start), end: byteToOffset(bytes, selection.end) } : undefined;
       self.postMessage({ id, type: "result", result: transformJavaScript(source, event.data.recipe as Recipe, range) });
+    } else if (action === "deobfuscate") {
+      const bytes = event.data.bytes as Uint8Array;
+      const source = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes);
+      self.postMessage({ id, type: "result", result: deobfuscateJavaScript(source, event.data.recipe as DeobfuscationRecipe, Boolean(event.data.removeDebugger)) });
     } else if (action === "potential") {
       const needle = new TextEncoder().encode(event.data.query as string);
       const results: Item[] = [];

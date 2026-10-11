@@ -1,6 +1,6 @@
 import { acquireWorker } from "./worker-queue";
 import type { Evidence, Location } from "./model";
-import type { Recipe, TransformPreview } from "./gap-analysis";
+import type { DeobfuscationRecipe, Recipe, TransformPreview } from "./gap-analysis";
 import { WORKER_TIMEOUT } from "./runtime";
 import { uid } from "./model";
 
@@ -11,6 +11,7 @@ type Message =
   | { action: "preview"; files: Evidence[]; fileId: string }
   | { action: "index"; files: Evidence[] }
   | { action: "transform"; bytes: Uint8Array; recipe: Recipe; location?: Location }
+  | { action: "deobfuscate"; bytes: Uint8Array; recipe: DeobfuscationRecipe; removeDebugger?: boolean }
   | { action: "potential"; files: Evidence[]; query: string }
   | { action: "decode"; operation: "base64" | "hex" | "url" | "strings" | "nested" | "gzip" | "deflate"; input: string };
 
@@ -43,7 +44,7 @@ export async function runResearchJob<T>(message: Message, signal?: AbortSignal):
       } else resultHandler?.call(worker, event);
     };
     const send = async () => {
-      const sourceFiles = "files" in message ? message.files : (message.action === "transform" || message.action === "har") ? [{ id: "input", bytes: message.bytes }] : message.action === "decode" ? [{ id: "input", bytes: new TextEncoder().encode(message.input) }] : [];
+      const sourceFiles = "files" in message ? message.files : (message.action === "transform" || message.action === "deobfuscate" || message.action === "har") ? [{ id: "input", bytes: message.bytes }] : message.action === "decode" ? [{ id: "input", bytes: new TextEncoder().encode(message.input) }] : [];
       const { files: _files, bytes: _bytes, input: _input, ...options } = message as any;
       worker.postMessage({ id, type: "start", options });
       for (const file of sourceFiles) {

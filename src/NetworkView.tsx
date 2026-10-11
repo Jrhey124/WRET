@@ -10,7 +10,7 @@ export function NetworkView({
   sessions,
   files,
   onOpenEvidence,
-  onImportHar, onCollect, onLinkEvidence, onBeautify, onReferences,
+  onImportHar, onCollect, onLinkEvidence, onBeautify, onReferences, onDeobfuscate,
 }: {
   sessions: DebugSession[];
   files: Evidence[];
@@ -20,6 +20,7 @@ export function NetworkView({
   onLinkEvidence: (sessionId: string, requestId: string, evidenceId: string) => void;
   onBeautify: (file: Evidence) => void;
   onReferences: (file: Evidence) => void;
+  onDeobfuscate: (file: Evidence) => void;
 }) {
   const [query, setQuery] = useState("");
   const [statusFilter, setStatusFilter] = useState("all");
@@ -29,6 +30,7 @@ export function NetworkView({
   const [scrollTop, setScrollTop] = useState(0);
   const [selectedId, setSelectedId] = useState("");
   const [detailTab, setDetailTab] = useState<DetailTab>("Overview");
+  const [copyStatus, setCopyStatus] = useState("");
   const entries = useMemo<NetworkEntry[]>(
     () => sessions.flatMap((session) => (session.requests || []).map((request) => ({ request, session }))),
     [sessions],
@@ -57,6 +59,18 @@ export function NetworkView({
   const linkedEvidence = files.find(f => f.id === activeEntry?.request.analystEvidenceId);
   const actionEvidence = responseEvidence || linkedEvidence;
   const detailTabs: DetailTab[] = ["Overview", "Request headers", "Response headers", "Response", "Initiator"];
+  async function copyRequestUrl(url: string) {
+    let copied = false;
+    try { if (navigator.clipboard?.writeText) { await navigator.clipboard.writeText(url); copied = true; } } catch { /* Try the browser-compatible fallback below. */ }
+    if (!copied) {
+      const field = document.createElement("textarea");
+      field.value = url; field.setAttribute("readonly", ""); field.style.position = "fixed"; field.style.opacity = "0";
+      document.body.append(field); field.select();
+      try { copied = document.execCommand("copy"); } catch { copied = false; }
+      field.remove();
+    }
+    setCopyStatus(copied ? "URL copied." : "Copy is unavailable here. Select the URL above and copy it manually.");
+  }
   return (
     <section className="network-workspace" aria-labelledby="network-title">
       <header className="network-heading">
@@ -85,7 +99,7 @@ export function NetworkView({
               {startRow > 0 && <tr aria-hidden="true"><td colSpan={7} style={{height:startRow * 64, padding:0}} /></tr>}
               {visible.map(({ request, session }, row) => (
                 <tr aria-rowindex={startRow + row + 2} style={{height:64}} key={`${session.id}:${request.id}`} className={activeEntry?.session.id === session.id && activeEntry.request.id === request.id ? "selected" : ""}>
-                  <td><button className="network-row-select" aria-pressed={activeEntry?.session.id === session.id && activeEntry.request.id === request.id} onKeyDown={e => { if (["ArrowDown", "ArrowUp", "Home", "End"].includes(e.key)) { e.preventDefault(); const index = startRow + row; const next = e.key === "Home" ? 0 : e.key === "End" ? filtered.length - 1 : Math.max(0, Math.min(filtered.length - 1, index + (e.key === "ArrowDown" ? 1 : -1))); const entry = filtered[next]; setSelectedId(`${entry.session.id}:${entry.request.id}`); const scroller = document.getElementById("request-scroll"); pendingFocus.current = next; setScrollTop(next * 64); scroller?.scrollTo(0, next * 64); } }} data-request-row={startRow + row} onClick={() => { setSelectedId(`${session.id}:${request.id}`); setDetailTab("Overview"); }} title={`${request.method} ${request.url}`}>{request.url || "(URL unavailable)"}<small>{session.target}</small></button></td>
+                  <td><button className="network-row-select" aria-pressed={activeEntry?.session.id === session.id && activeEntry.request.id === request.id} onKeyDown={e => { if (["ArrowDown", "ArrowUp", "Home", "End"].includes(e.key)) { e.preventDefault(); const index = startRow + row; const next = e.key === "Home" ? 0 : e.key === "End" ? filtered.length - 1 : Math.max(0, Math.min(filtered.length - 1, index + (e.key === "ArrowDown" ? 1 : -1))); const entry = filtered[next]; setSelectedId(`${entry.session.id}:${entry.request.id}`); const scroller = document.getElementById("request-scroll"); pendingFocus.current = next; setScrollTop(next * 64); scroller?.scrollTo(0, next * 64); } }} data-request-row={startRow + row} onClick={() => { setSelectedId(`${session.id}:${request.id}`); setDetailTab("Overview"); }} title="Select request to inspect its captured details.">{request.url || "(URL unavailable)"}<small>{session.target}</small></button></td>
                   <td>{request.method}</td>
                   <td><span className={`network-status ${request.blockedReason ? "failed" : ""}`}>{request.blockedReason ? "Blocked" : request.status ?? "Pending"}</span></td>
                   <td>{request.resourceType || request.mimeType || "Other"}</td>
@@ -101,9 +115,10 @@ export function NetworkView({
           {!!entries.length && !filtered.length && <p className="network-empty-small">No requests match these filters.</p>}
         </div>
         {activeEntry && <aside className="network-details" aria-label="Selected request details">
-          <h2 title={activeEntry.request.url}>{activeEntry.request.url}</h2>
+          <h2 className="network-request-url">{activeEntry.request.url}</h2>
+          <button type="button" onClick={() => void copyRequestUrl(activeEntry.request.url)}>Copy URL</button>{copyStatus && <span role="status">{copyStatus}</span>}
           <p>Response body: {activeEntry.request.bodyAvailability || "Not recorded"}</p>
-          <div className="workspace-toolbar"><button disabled={!actionEvidence} title={!actionEvidence ? "Import or associate response evidence first." : "Inspect preserved evidence."} onClick={() => actionEvidence && onOpenEvidence(actionEvidence)}>Open response evidence</button><button disabled={!actionEvidence || (actionEvidence.byteLength ?? actionEvidence.bytes.length) > 5 * 1024 * 1024 || !["javascript", "json", "html", "css", "sourcemap"].includes(actionEvidence.format)} title="Requires supported text evidence, up to 5 MiB." onClick={() => actionEvidence && onBeautify(actionEvidence)}>Beautify</button><button disabled={!actionEvidence} title="Choose an identifier or literal query in Cross-references." onClick={() => actionEvidence && onReferences(actionEvidence)}>Find related references</button></div>
+          <div className="workspace-toolbar"><button disabled={!actionEvidence} title={!actionEvidence ? "Import or associate response evidence first." : "Inspect preserved evidence."} onClick={() => actionEvidence && onOpenEvidence(actionEvidence)}>Open response evidence</button><button disabled={!actionEvidence || (actionEvidence.byteLength ?? actionEvidence.bytes.length) > 5 * 1024 * 1024 || !["javascript", "json", "html", "css", "sourcemap"].includes(actionEvidence.format)} title="Requires supported text evidence, up to 5 MiB." onClick={() => actionEvidence && onBeautify(actionEvidence)}>Beautify</button><button disabled={!actionEvidence || actionEvidence.format !== "javascript" || (actionEvidence.byteLength ?? actionEvidence.bytes.length) > 1024 * 1024} title="Preview conservative JavaScript cleanup on supported evidence up to 1 MiB." onClick={() => actionEvidence && onDeobfuscate(actionEvidence)}>Deobfuscate</button><button disabled={!actionEvidence} title="Choose an identifier or literal query in Cross-references." onClick={() => actionEvidence && onReferences(actionEvidence)}>Find related references</button></div>
           <label>Analyst evidence association<select aria-label="Associate request evidence" value={activeEntry.request.analystEvidenceId || ""} onChange={e => onLinkEvidence(activeEntry.session.id, activeEntry.request.id, e.target.value)}><option value="">No analyst association</option>{files.map(f => <option key={f.id} value={f.id}>{f.name}</option>)}</select></label><p>This manual association is an analyst interpretation, not an observed source relationship.</p>
           <p>{activeEntry.request.method} · {activeEntry.request.status ?? (activeEntry.request.blockedReason ? "Blocked" : "Pending")} · {activeEntry.request.mimeType || activeEntry.request.resourceType || "Unknown type"}</p>
           {!!activeEntry.request.blockedReason && <p className="alert">{activeEntry.request.blockedReason}</p>}

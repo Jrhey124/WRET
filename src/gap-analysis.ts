@@ -4,9 +4,11 @@ import { analyze as scopes } from "eslint-scope";
 import { decodeText, type Evidence, type Location } from "./model";
 import { foldStrings } from "./investigation";
 
-export const RECIPES = ["fold-strings", "literal-constants", "static-branches", "remove-debugger"] as const;
+export const RECIPES = ["fold-strings", "literal-constants", "static-branches", "remove-debugger", "const-string-arrays", "normalize-properties"] as const;
 export type Recipe = typeof RECIPES[number];
-export interface TransformPreview { source: string; changes: number; diagnostics: string[] }
+export type DeobfuscationRecipe = Recipe | "conservative-cleanup";
+export interface TransformStepPreview { recipe: Recipe; source: string; changes: number; diagnostics: string[]; pass?: number; preset?: string }
+export interface TransformPreview { source: string; changes: number; diagnostics: string[]; steps?: TransformStepPreview[] }
 function syntax(source: string) {
   const options = { ecmaVersion: "latest" as const, ranges: true };
   try { return { ast: parse(source, { ...options, sourceType: "module" }), sourceType: "module" as const }; }
@@ -48,13 +50,20 @@ function constant(node: any): ReturnType<typeof literal> {
 export function transformJavaScript(source: string, recipe: Recipe, range?: { start: number; end: number }): TransformPreview {
   if (new TextEncoder().encode(source).length > 1024 * 1024) throw new Error("Transform input exceeds 1 MiB.");
   if (!RECIPES.includes(recipe)) throw new Error("Unknown transformation recipe.");
-  const { ast } = syntax(source);
+  const { ast, sourceType } = syntax(source);
   if (range && (!Number.isSafeInteger(range.start) || !Number.isSafeInteger(range.end) || range.start < 0 || range.end > source.length || range.end <= range.start)) throw new Error("Invalid source selection.");
   if (recipe === "fold-strings") {
     if (range) throw new Error("String binding folding needs the entire file. Choose literal constants for selection-only folding.");
-    const result = foldStrings(source);
+    const manager = scopes(ast as any, { ecmaVersion: 2022, sourceType, optimistic: false, ignoreEval: false });
+    if (manager.scopes.some((scope: any) => scope.type === "with" || scope.directCallToEval)) return { source, changes: 0, diagnostics: ["Skipped constant string folding because eval or with can change name resolution."] };
+    const result = foldStrings(source, 5000);
     syntax(result);
+    if (new TextEncoder().encode(result).length > 2 * 1024 * 1024) throw new Error("Transformation output exceeds 2 MiB.");
     return { source: result, changes: result === source ? 0 : 1, diagnostics: ["Constant string folding retains lexical scope boundaries."] };
+  }
+  if (recipe === "const-string-arrays" || recipe === "normalize-properties") {
+    if (range) throw new Error("This scope-aware recipe requires the whole file.");
+    return runRecipe(source, recipe);
   }
   const edits: { start: number; end: number; text: string }[] = [];
   const diagnostics: string[] = [];
@@ -71,9 +80,9 @@ export function transformJavaScript(source: string, recipe: Recipe, range?: { st
       if (!test) return;
       const kept = test.value ? node.consequent : node.alternate;
       const removed = test.value ? node.alternate : node.consequent;
-      let hoisted = false;
+      let hoisted = Boolean(kept?.directive || kept?.type === "ExpressionStatement" && kept.expression?.type === "Literal" && typeof kept.expression.value === "string");
       if (removed) fullAncestor(removed, (child: any) => { if (child.type === "FunctionDeclaration" || child.type === "VariableDeclaration" && child.kind === "var") hoisted = true; });
-      if (hoisted) { diagnostics.push("Kept a constant branch because removing it could change hoisted declarations."); return; }
+      if (hoisted) { diagnostics.push("Kept a constant branch because removing it could change hoisting or directive semantics."); return; }
       const text = kept ? source.slice(kept.start, kept.end) : ";";
       edits.push({ start: node.start, end: node.end, text: node.type === "ConditionalExpression" ? `(${text})` : text });
     }
@@ -82,10 +91,119 @@ export function transformJavaScript(source: string, recipe: Recipe, range?: { st
   const selected = edits.sort((a, b) => a.start - b.start || b.end - a.end).filter((edit, index, all) => !all.slice(0, index).some((other) => other.start <= edit.start && other.end >= edit.end));
   let result = source;
   for (const edit of selected.reverse()) result = result.slice(0, edit.start) + edit.text + result.slice(edit.end);
+  if (new TextEncoder().encode(result).length > 2 * 1024 * 1024) throw new Error("Transformation output exceeds 2 MiB.");
   syntax(result);
   if (edits.length >= 5000) diagnostics.push("Transformation stopped at 5,000 candidate edits.");
   if (recipe === "remove-debugger") diagnostics.push("Removing debugger statements changes behavior. Timing checks and other protections remain.");
   return { source: result, changes: selected.length, diagnostics: [...new Set(diagnostics)] };
+}
+
+function specializedEdits(source: string, recipe: "const-string-arrays" | "normalize-properties") {
+  const { ast, sourceType } = syntax(source);
+  const candidates: { node: any; parent: any; ancestors: any[] }[] = [];
+  fullAncestor(ast, (node: any, _state: unknown, ancestors: any[]) => candidates.push({ node, parent: ancestors.at(-2), ancestors: [...ancestors] }));
+  const edits: { start: number; end: number; text: string }[] = [];
+  const diagnostics: string[] = [];
+  if (recipe === "normalize-properties") {
+    let skipped = 0;
+    for (const { node, parent } of candidates) {
+      if (node.type !== "MemberExpression" || !node.computed) continue;
+      if (node.optional || node.property.type !== "Literal" || typeof node.property.value !== "string" || !/^[A-Za-z_$][A-Za-z0-9_$]*$/.test(node.property.value)) { skipped++; continue; }
+      const isWrite = parent && ((parent.type === "AssignmentExpression" && parent.left === node) || (["UpdateExpression", "UnaryExpression"].includes(parent.type) && (parent.type === "UpdateExpression" || parent.operator === "delete") && parent.argument === node));
+      if (isWrite) { skipped++; continue; }
+      const objectSource = source.slice(node.object.start, node.object.end);
+      const primaryObject = ["Identifier", "ThisExpression", "Super", "MemberExpression", "CallExpression", "NewExpression", "ChainExpression"].includes(node.object.type);
+      edits.push({ start: node.start, end: node.end, text: `${primaryObject ? objectSource : `(${objectSource})`}.${node.property.value}` });
+    }
+    if (skipped) diagnostics.push(`Skipped ${skipped} computed property access(es) because the key or access context was unsupported, optional, or a write.`);
+  } else {
+    const manager = scopes(ast as any, { ecmaVersion: 2022, sourceType, optimistic: false, ignoreEval: false });
+    if (manager.scopes.some((scope: any) => scope.type === "with" || scope.directCallToEval)) {
+      diagnostics.push("Skipped string-array lookups because this file contains eval or with, which can change name resolution.");
+      return { edits, diagnostics };
+    }
+    const declarators = candidates.filter(({ node, parent, ancestors }) => node.type === "VariableDeclarator" && node.id.type === "Identifier" && node.init?.type === "ArrayExpression" && parent?.type === "VariableDeclaration" && parent.kind === "const" && !ancestors.some((ancestor: any) => ["ExportNamedDeclaration", "ExportDefaultDeclaration"].includes(ancestor.type)) && node.init.elements.length > 0 && node.init.elements.every((item: any) => item?.type === "Literal" && typeof item.value === "string" && !item.regex));
+    const unsafe = new Set<string>();
+    for (const { node } of declarators) {
+      const variable = manager.scopes.flatMap((scope: any) => scope.variables).find((candidate: any) => candidate.identifiers.includes(node.id));
+      if (!variable) { unsafe.add(node.id.name); continue; }
+      for (const reference of variable.references) {
+        if (reference.init) continue;
+        if (reference.isWrite() || reference.identifier.start <= node.end) { unsafe.add(node.id.name); break; }
+        const use = candidates.find(({ node: candidate }) => candidate === reference.identifier);
+        const member = use?.parent;
+        const memberUse = member?.type === "MemberExpression" && member.object === reference.identifier && member.computed && !member.optional && member.property.type === "Literal" && Number.isSafeInteger(member.property.value) && member.property.value >= 0 && member.property.value < node.init.elements.length;
+        const accessParent = candidates.find(({ node: candidate }) => candidate === member)?.parent;
+        const memberAncestors = use?.ancestors.slice(use.ancestors.indexOf(member) + 1) || [];
+        const riskyType = (ancestor: any) => ["AssignmentExpression", "UpdateExpression", "ForInStatement", "ForOfStatement", "ObjectPattern", "ArrayPattern"].includes(ancestor.type) || ancestor.type === "UnaryExpression" && ancestor.operator === "delete";
+        const riskyUse = memberUse && (riskyType(accessParent) || memberAncestors.some(riskyType));
+        const callUse = memberUse && ((["CallExpression", "NewExpression"].includes(accessParent?.type) && accessParent.callee === member) || accessParent?.type === "TaggedTemplateExpression" && accessParent.tag === member || memberAncestors.some((ancestor: any) => (["CallExpression", "NewExpression"].includes(ancestor.type) && ancestor.callee === member) || ancestor.type === "TaggedTemplateExpression" && ancestor.tag === member));
+        const insideFunction = use?.ancestors.some((ancestor: any) => ["FunctionDeclaration", "FunctionExpression", "ArrowFunctionExpression"].includes(ancestor.type));
+        if (!memberUse || riskyUse || callUse || insideFunction) { unsafe.add(node.id.name); break; }
+      }
+    }
+    for (const { node } of declarators) {
+      if (unsafe.has(node.id.name)) { diagnostics.push(`Skipped ${node.id.name}: its array binding or initialization timing is not proven safe.`); continue; }
+      const variable = manager.scopes.flatMap((scope: any) => scope.variables).find((candidate: any) => candidate.identifiers.includes(node.id));
+      for (const reference of variable?.references || []) {
+        if (reference.init) continue;
+        const use = candidates.find(({ node: candidate }) => candidate === reference.identifier);
+        const member = use?.parent;
+        if (!member || member.type !== "MemberExpression") continue;
+        const index = member.property.value as number;
+        edits.push({ start: member.start, end: member.end, text: JSON.stringify(node.init.elements[index].value) });
+      }
+    }
+    if (declarators.length === 0) diagnostics.push("No scope-resolved const string-array lookup patterns were found.");
+  }
+  if (edits.length > 5000) throw new Error("A recipe exceeded the 5,000 edit limit.");
+  return { edits, diagnostics };
+}
+
+function runRecipe(source: string, recipe: Recipe): TransformStepPreview {
+  if (recipe === "const-string-arrays" || recipe === "normalize-properties") {
+    const { edits, diagnostics } = specializedEdits(source, recipe);
+    const selected = edits.sort((a, b) => a.start - b.start || b.end - a.end).filter((edit, index, all) => !all.slice(0, index).some((other) => other.start <= edit.start && other.end >= edit.end));
+    let result = source;
+    for (const edit of selected.reverse()) result = result.slice(0, edit.start) + edit.text + result.slice(edit.end);
+    if (new TextEncoder().encode(result).length > 2 * 1024 * 1024) throw new Error("Transformation output exceeds 2 MiB.");
+    syntax(result);
+    return { recipe, source: result, changes: selected.length, diagnostics };
+  }
+  const preview = transformJavaScript(source, recipe);
+  if (new TextEncoder().encode(preview.source).length > 2 * 1024 * 1024) throw new Error("Transformation output exceeds 2 MiB.");
+  return { recipe, ...preview };
+}
+
+/** A preview-only, non-executing cleanup pipeline. Debugger removal is opt-in. */
+export function deobfuscateJavaScript(source: string, recipe: DeobfuscationRecipe = "conservative-cleanup", removeDebugger = false): TransformPreview {
+  if (new TextEncoder().encode(source).length > 1024 * 1024) throw new Error("Transform input exceeds 1 MiB.");
+  const recipes: Recipe[] = recipe === "conservative-cleanup"
+    ? ["fold-strings", "literal-constants", "const-string-arrays", "normalize-properties", "static-branches", ...(removeDebugger ? ["remove-debugger" as const] : [])]
+    : [recipe];
+  const steps: TransformStepPreview[] = [];
+  let current = source;
+  let outputBudget = 0;
+  const passes = recipe === "conservative-cleanup" ? 3 : 1;
+  for (let pass = 0; pass < passes; pass++) {
+    let changed = false;
+    for (const item of recipes) {
+      const step = runRecipe(current, item);
+      if (!step.changes) { if (step.diagnostics.length) steps.push(step); continue; }
+      changed = true; current = step.source; outputBudget += new TextEncoder().encode(current).length;
+      if (outputBudget > 8 * 1024 * 1024) throw new Error("Deobfuscation preview exceeds the 8 MiB workspace output budget.");
+      steps.push({ ...step, pass: pass + 1, preset: recipe });
+    }
+    if (!changed) break;
+  }
+  const reported = new Set<Recipe>();
+  const visibleSteps = steps.filter((step) => {
+    if (step.changes) return true;
+    if (!step.diagnostics.length || reported.has(step.recipe)) return false;
+    reported.add(step.recipe);
+    return true;
+  });
+  return { source: current, changes: steps.reduce((sum, step) => sum + step.changes, 0), diagnostics: [...new Set(steps.flatMap(step => step.diagnostics))], steps: visibleSteps };
 }
 
 export interface CrossReference { name: string; access: "read" | "write" | "read/write" | "dynamic"; location: Location; definition?: Location; certainty: "lexical" | "module" | "unresolved" }

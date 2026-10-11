@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { observedContracts, snapshotDifferences, transformJavaScript, workspaceReferences } from "../../src/gap-analysis";
+import { deobfuscateJavaScript, observedContracts, snapshotDifferences, transformJavaScript, workspaceReferences } from "../../src/gap-analysis";
 import { exportProject, importProject } from "../../src/storage";
 import { newProject, removeEvidence, sha256, type Evidence } from "../../src/model";
 const file = (id: string, name: string, source: string): Evidence => ({ id, name, bytes: new TextEncoder().encode(source), format: name.endsWith(".js") ? "javascript" : "json" });
@@ -15,13 +15,52 @@ describe("gap investigation tools", () => {
     expect(result.source).toContain("if(false){var hoisted=1;}");
     expect(result.source).toContain("{run();}");
     expect(result.source).not.toContain("other()");
-    expect(result.diagnostics).toContain("Kept a constant branch because removing it could change hoisted declarations.");
+    expect(result.diagnostics).toContain("Kept a constant branch because removing it could change hoisting or directive semantics.");
+    expect(transformJavaScript('if(true) "use strict";', "static-branches").source).toBe('if(true) "use strict";');
   });
   it("limits transformations to AST nodes inside the original selection", () => {
     const source = "let a=1+2; let b=3+4; debugger;";
     const result = transformJavaScript(source, "literal-constants", { start: 6, end: 9 });
     expect(result.source).toBe("let a=(3); let b=3+4; debugger;");
     expect(transformJavaScript('const s="debugger;"; debugger;', "remove-debugger").source).toBe('const s="debugger;"; ;');
+  });
+  it("runs conservative cleanup without executing code and records changed recipe stages", () => {
+    const source = 'const _0x=["admin","password"]; const key="api_"+"key"; send(_0x[0], _0x[1], object["name"], key); if(false){ dead(); } else { keep(); } debugger;';
+    const result = deobfuscateJavaScript(source);
+    expect(result.source).toContain('send("admin", "password", object.name, key)');
+    expect(result.source).toContain("{ keep(); }");
+    expect(result.source).toContain("debugger;");
+    const changedSteps = result.steps?.filter(step => step.changes);
+    expect(changedSteps?.map(step => step.recipe)).toEqual(["fold-strings", "const-string-arrays", "normalize-properties", "static-branches"]);
+    expect(changedSteps?.every(step => step.changes > 0)).toBe(true);
+  });
+  it("leaves string arrays unchanged when references mutate, escape, are dynamic, or execute later", () => {
+    for (const source of [
+      'const values=["x"]; values[0]="y"; use(values[0]);',
+      'const values=["x"]; const alias=values; use(values[0]);',
+      'const values=["x"]; use(values[index]);',
+      'const values=["x"]; function later(){ return values[0]; }',
+      'const values=["x"]; use(values[0]());',
+      'const values=["x"]; values[0]\`tag\`;',
+      'const values=["x"]; eval("values"); use(values[0]);',
+      'use(values[0]); const values=["x"];',
+      'export const values=["x"]; use(values[0]);',
+      'with (scope) { const values=["x"]; use(values[0]); }',
+    ]) {
+      const result = deobfuscateJavaScript(source, "const-string-arrays");
+      expect(result.source).toBe(source);
+    }
+  });
+  it("normalizes only supported computed property reads and keeps optional chains and writes", () => {
+    const source = 'obj["name"]; obj["not-valid-key"]; obj?.["name"]; obj["name"]=1;';
+    const result = deobfuscateJavaScript(source, "normalize-properties");
+    expect(result.source).toBe('obj.name; obj["not-valid-key"]; obj?.["name"]; obj["name"]=1;');
+    expect(deobfuscateJavaScript('(getObject()["name"]);', "normalize-properties").source).toBe('(getObject().name);');
+  });
+  it("makes debugger removal explicitly opt-in and rejects malformed code", () => {
+    expect(deobfuscateJavaScript("debugger;").source).toBe("debugger;");
+    expect(deobfuscateJavaScript("debugger;", "conservative-cleanup", true).source).toBe(";");
+    expect(() => deobfuscateJavaScript("function {")).toThrow();
   });
   it("resolves module imports and shadowed reads/writes while keeping dynamic properties unresolved", () => {
     const a = file("a", "site/a.js", "export const answer=42;");

@@ -453,7 +453,14 @@ export function App() {
     setWatLine(undefined);
   }
   const [researchTab, setResearchTab] = useState("Transforms");
+  const [researchFileId, setResearchFileId] = useState("");
   const [pendingBeautify, setPendingBeautify] = useState("");
+  function openDeobfuscator(evidence: Evidence) {
+    setLocation({ fileId: evidence.id, start: 0, end: 0 });
+    setResearchFileId(evidence.id);
+    setResearchTab("Deobfuscate");
+    setMode("Research");
+  }
   useEffect(() => { if (pendingBeautify && file?.id === pendingBeautify) { setPendingBeautify(""); void startBeautify(); } }, [pendingBeautify, file?.id]);
   async function startBeautify() {
     if (!file || evidenceSize(file) > 5 * 1024 * 1024 || beautifying) return;
@@ -1053,6 +1060,7 @@ export function App() {
     { id: "collect-website", label: "Collect website evidence", description: "Guide browser recording and offline HAR import.", keywords: "website capture har devtools collect", run: selectCollection },
     ...(file?.format === "wasm" ? [{ id: "inspect-wasm", label: "Open WebAssembly workbench", description: "Search indexed instructions, rename functions with aliases, inspect direct calls, and navigate to original module bytes.", keywords: "wasm webassembly disassemble instruction function rename alias references", run: () => { setMode("Inspect"); setView("Wasm"); } }] : []),
     ...(file && ["html", "javascript", "css", "json", "sourcemap"].includes(file.format) ? [{ id: "beautify-selected", label: "Beautify selected evidence", description: "Create a formatted view in a worker while preserving the imported bytes.", keywords: "format prettify beautified source", disabledReason: beautifying ? "Beautify is already in progress." : evidenceSize(file) > 5 * 1024 * 1024 ? "Beautify supports sources up to 5 MiB." : undefined, run: () => { setMode("Inspect"); startBeautify(); } }] : []),
+    ...(file?.format === "javascript" ? [{ id: "deobfuscate-selected", label: "Deobfuscate selected JavaScript", description: "Preview conservative syntax based cleanup without executing imported code.", keywords: "deobfuscate deobfuscation javascript simplify cleanup strings array properties branches", disabledReason: evidenceSize(file) > 1024 * 1024 ? "Deobfuscation supports files up to 1 MiB." : undefined, run: () => openDeobfuscator(file) }] : []),
     {
       id: "open-welcome",
       label: "Open or show Welcome tab",
@@ -1448,10 +1456,11 @@ export function App() {
         onLinkEvidence={(sessionId, requestId, evidenceId) => update(p => ({ ...p, sessions: p.sessions?.map(s => s.id === sessionId ? { ...s, requests: s.requests?.map(r => r.id === requestId ? { ...r, analystEvidenceId: evidenceId || undefined } : r) } : s) }))}
         onBeautify={(evidence) => { selectFile(evidence); setPendingBeautify(evidence.id); }}
         onReferences={(evidence) => { setLocation({ fileId: evidence.id, start: 0, end: 0 }); setResearchTab("Cross-references"); setMode("Research"); }}
+        onDeobfuscate={openDeobfuscator}
         onImportHar={() => harInput.current?.click()}
       />}
       {mode === "Observations" && <SavedObservations project={project} />}
-      {mode === "Research" && <ResearchView project={project} selection={location} initialTab={researchTab} update={update} navigate={navigate} />}
+      {mode === "Research" && <ResearchView project={project} selection={location} initialTab={researchTab} initialFileId={researchFileId} update={update} navigate={navigate} />}
       {mode === "Report" && (
         <section className="guided-overview">
           <h1>Investigation report</h1>
@@ -1550,6 +1559,7 @@ export function App() {
           return <div className="file-menu-dismiss" onMouseDown={() => setFileMenu(undefined)}>
             <div className="file-context-menu" role="menu" style={{ left:fileMenu.x, top:fileMenu.y }} onMouseDown={(event) => event.stopPropagation()}>
               <button role="menuitem" onClick={() => { selectFile(menuFile); setFileMenu(undefined); }}>Inspect <span>{menuFile.name}</span></button>
+              {menuFile.format === "javascript" && <button role="menuitem" disabled={evidenceSize(menuFile) > 1024 * 1024} title={evidenceSize(menuFile) > 1024 * 1024 ? "Deobfuscation supports files up to 1 MiB." : "Preview conservative cleanup without executing code."} onClick={() => { openDeobfuscator(menuFile); setFileMenu(undefined); }}>Deobfuscate JavaScript</button>}
               <Tooltip content={!canDeleteEvidence ? "Wait for analysis to finish before deleting evidence." : "Remove this evidence and its linked records from this project. The original file on your device is untouched."}><button role="menuitem" disabled={!canDeleteEvidence} title={!canDeleteEvidence ? "Wait for analysis to finish before deleting evidence" : "Remove this evidence and its linked records from the project"} onClick={() => deleteEvidence(menuFile)}>Delete <span>{menuFile.name}</span></button></Tooltip>
             </div>
           </div>;
@@ -1622,6 +1632,7 @@ export function App() {
                 ))}
               </div>
               <div className="view-actions"><Tooltip content="Format HTML, JavaScript, CSS, JSON, or a source map in a worker. Original evidence stays unchanged."><button onClick={startBeautify} disabled={beautifying || evidenceSize(file) > 5 * 1024 * 1024 || !["html", "javascript", "css", "json", "sourcemap"].includes(file.format)} title={beautifying ? "Beautifying is already in progress." : evidenceSize(file) > 5 * 1024 * 1024 ? "Beautify supports sources up to 5 MiB." : !["html", "javascript", "css", "json", "sourcemap"].includes(file.format) ? "This evidence format is not supported by Beautify." : "Create a formatted view; original evidence stays unchanged."}>{beautifying ? "Beautifying…" : "Beautify"}</button></Tooltip>
+                {file.format === "javascript" && <Tooltip content="Preview conservative JavaScript cleanup. It never executes the imported code; review the proposed derived evidence before saving."><button onClick={() => openDeobfuscator(file)} disabled={evidenceSize(file) > 1024 * 1024} title={evidenceSize(file) > 1024 * 1024 ? "Deobfuscation supports files up to 1 MiB." : "Open the dedicated deobfuscation preview."}>Deobfuscate</button></Tooltip>}
                 {beautifying && <button onClick={cancelBeautify} aria-label="Cancel beautifying">Cancel</button>}</div>
               <div className="view-content">
                 {file.contentStored && evidenceSize(file) <= 2 * 1024 * 1024 && file.bytes.length !== evidenceSize(file) && <p role="status">Loading evidence from browser storage?</p>}

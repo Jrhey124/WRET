@@ -282,16 +282,15 @@ export function sourceMappings(
   }
   return { mappings, diagnostics };
 }
-export function foldStrings(input: string): string {
+export function foldStrings(input: string, maxEdits = Number.POSITIVE_INFINITY): string {
   if (input.length > 1024 * 1024) throw new Error("Recipe input exceeds 1 MiB");
-  const ast = parse(input, {
-    ecmaVersion: "latest",
-    sourceType: "module",
-    ranges: true,
-  });
+  let sourceType: "module" | "script" = "module";
+  let ast: any;
+  try { ast = parse(input, { ecmaVersion: "latest", sourceType, ranges: true }); }
+  catch { sourceType = "script"; ast = parse(input, { ecmaVersion: "latest", sourceType, ranges: true }); }
   const scopes = analyzeScopes(ast as any, {
     ecmaVersion: 2022,
-    sourceType: "module",
+    sourceType,
     optimistic: false,
   });
   const constants = new Map<object, any>();
@@ -345,7 +344,7 @@ export function foldStrings(input: string): string {
       !replacements.some(
         (y) => y !== x && y.start <= x.start && y.end >= x.end,
       ),
-  );
+  ).slice(0, maxEdits);
   for (const item of outer.sort((a, b) => b.start - a.start))
     input = input.slice(0, item.start) + item.value + input.slice(item.end);
   return input;
