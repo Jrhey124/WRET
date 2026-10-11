@@ -16,3 +16,9 @@ Docker build/container smoke checks were unavailable: local Docker configuration
 Imported JavaScript and Wasm are never executed. Worker deadlines and cancellation keep parsing bounded; workers are not an execution sandbox. Static previews retain an empty iframe sandbox, restrictive CSP, local resource limits, and reconstruction output limits. Large imports, parsing, and portable archive export can still use substantial client memory.
 
 Archive schemas, browser storage identifiers, original hashes, notes, aliases, transformations, and historical runtime records remain compatible. No remote CI or hardware acceptance is claimed by these local results.
+
+## Guided website collection milestone
+
+Implemented a closable collection guide, explicit URL opening, capture coverage, recorded initiator links, analyst associations, virtualized request rows, keyboard navigation, and archive-compatible optional fields. Unit checks cover URL restrictions, bounded text/base64 bodies, malformed records, provenance validation, deletion cleanup, and archive round trips. Browser checks include a deterministic website recorded into HAR (HTML, CSS, JS, Wasm, API, redirect), cancellation with unchanged project state, 500-row navigation, 200% zoom, and persistence.
+
+Manual DevTools toolbar/export interaction and actual Pi hosting were not exercised. The deterministic capture uses browser automation to write HAR; it verifies browser-produced archives without claiming a manual DevTools acceptance run. Resource use on the Pi has not been measured.

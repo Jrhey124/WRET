@@ -34,3 +34,9 @@ npm run test:e2e
 ```
 
 Use `WRET_BROWSER=msedge` for Edge. Technical WRET storage identifiers remain for compatibility. Browser parsing uses bounded cancellable workers; large files can still require significant client memory.
+
+## Collect website evidence
+
+Open **Collect website evidence** from Welcome, Overview, Network, or Commands. Use Chrome or Edge DevTools to record Network activity with Preserve log, export a sanitized HAR, and import it. Optional saved files and folders supplement missing bodies. Whidra never fetches recorded URLs; the URL action opens a separate tab for manual collection.
+
+Network displays capture coverage and body availability. Recorded initiators link by exact source URL; analyst evidence associations are labeled as interpretations. Sanitized HAR files can still contain sensitive response content. Review evidence before sharing.

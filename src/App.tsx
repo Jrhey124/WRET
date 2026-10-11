@@ -1,3 +1,4 @@
+import { CollectionGuide } from "./CollectionGuide";
 import { searchEvidence } from "./search-runtime";
 import { evidenceSize } from "./model";
 import { readEvidenceRange, materializeEvidence } from "./storage";
@@ -48,7 +49,7 @@ import whidraLogoUrl from "./assets/whidra-hydra-gear.png";
 import packageJson from "../package.json";
 import { WasmView } from "./WasmView";
 import BeautifyWorker from "./analysis.worker?worker";
-import { HAR_LIMIT, type HarImport } from "./har";
+import { HAR_LIMIT, captureCoverage, type HarImport } from "./har";
 import {
   dependencies,
   sourceMappings,
@@ -73,6 +74,7 @@ type View =
   "Original" | "Hex" | "Beautified" | "AST" | "WAT" | "Wasm" | "Graph" | "Decode" | "Render";
 type Panel =
   "Findings" | "Symbols" | "Search" | "Notes" | "Strings" | "Sections";
+const COLLECTION_TAB_ID = "__whidra_collect__";
 const WELCOME_TAB_ID = "__wret_welcome__";
 type PaletteCommand = {
   id: string;
@@ -450,6 +452,9 @@ export function App() {
     setHexPage(0);
     setWatLine(undefined);
   }
+  const [researchTab, setResearchTab] = useState("Transforms");
+  const [pendingBeautify, setPendingBeautify] = useState("");
+  useEffect(() => { if (pendingBeautify && file?.id === pendingBeautify) { setPendingBeautify(""); void startBeautify(); } }, [pendingBeautify, file?.id]);
   async function startBeautify() {
     if (!file || evidenceSize(file) > 5 * 1024 * 1024 || beautifying) return;
     setError(""); setBeautifying(true);
@@ -504,6 +509,10 @@ export function App() {
     beautifyAbort.current?.abort();
     if (beautifyTimeout.current) clearTimeout(beautifyTimeout.current); beautifyTimeout.current = undefined; beautifyWorker.current?.terminate(); beautifyWorker.current = undefined; beautifyRelease.current?.(); beautifyRelease.current = undefined; setBeautifying(false);
   }
+  function selectCollection() {
+    setMode("Inspect"); setSelected(COLLECTION_TAB_ID); setOpenTabs(tabs => tabs.includes(COLLECTION_TAB_ID) ? tabs : [...tabs, COLLECTION_TAB_ID]); setLocation(undefined);
+  }
+  const harAbort = useRef<AbortController | null>(null);
   function selectWelcome() {
     setMode("Inspect");
     setSelected(WELCOME_TAB_ID);
@@ -520,6 +529,7 @@ export function App() {
     if (selected === id) {
       const nextId = nextTabs[Math.min(index, nextTabs.length - 1)] || "";
       setSelected(nextId);
+      requestAnimationFrame(() => { document.querySelector<HTMLButtonElement>('.evidence-tab button[aria-selected="true"]')?.focus(); });
       setLocation(undefined);
       setHexPage(0);
       setWatLine(undefined);
@@ -785,15 +795,17 @@ export function App() {
     if (!upload || busy || lock.current) return;
     setBusy(true);
     setError("");
+    const controller = new AbortController(); harAbort.current = controller;
     try {
       if (upload.size > HAR_LIMIT) throw new Error("HAR exceeds the 25 MiB import limit.");
-      const parsed = await runResearchJob<HarImport>({ action: "har", bytes: new Uint8Array(await upload.arrayBuffer()) });
+      const parsed = await runResearchJob<HarImport>({ action: "har", bytes: new Uint8Array(await upload.arrayBuffer()) }, controller.signal);
       if ((current.current.sessions || []).length >= 100)
         throw new Error("This project already has 100 runtime or imported capture sessions.");
       const evidenceByPlaceholder = new Map<string, string>();
       const capturedFiles: Evidence[] = [];
       let available = PROJECT_LIMIT - current.current.files.reduce((sum, file) => sum + evidenceSize(file), 0);
       for (const resource of parsed.resources) {
+        if (controller.signal.aborted) throw new Error("HAR import cancelled; project unchanged.");
         const hash = await sha256(resource.bytes);
         const existing = current.current.files.find((file) => file.hash === hash) || capturedFiles.find((file) => file.hash === hash);
         if (existing) {
@@ -812,7 +824,7 @@ export function App() {
       }
       const requests = parsed.requests.map((request) => {
         const fileId = request.evidenceId ? evidenceByPlaceholder.get(request.evidenceId) : undefined;
-        return { ...request, evidenceId: fileId, truncated: request.truncated || Boolean(request.evidenceId && !fileId) };
+        return { ...request, bodyAvailability: request.evidenceId && !fileId ? "budget-omitted" as const : request.bodyAvailability, evidenceId: fileId, truncated: request.truncated || Boolean(request.evidenceId && !fileId) };
       });
       const id = uid();
       const sessionBytes = new TextEncoder().encode(JSON.stringify(requests)).length + capturedFiles.reduce((sum, file) => sum + evidenceSize(file), 0);
@@ -833,6 +845,9 @@ export function App() {
           truncated: parsed.truncated || requests.some((request) => request.truncated),
         }],
       };
+      if (controller.signal.aborted) throw new Error("HAR import cancelled; project unchanged.");
+      next.sessions![next.sessions!.length - 1].coverage = captureCoverage(requests, parsed.coverage.invalidEntries, parsed.coverage.skippedEntries);
+      next.sessions![next.sessions!.length - 1].captureSource = { kind: "har", filename: upload.name.slice(0, 500) };
       validateProjectBudgets(next);
       update(() => next);
       setMode("Network");
@@ -840,6 +855,7 @@ export function App() {
       setError(`Could not import HAR: ${String(e)}`);
     } finally {
       setBusy(false);
+      harAbort.current = null;
       if (harInput.current) harInput.current.value = "";
     }
   }
@@ -1034,6 +1050,7 @@ export function App() {
       run: () => setMode(section),
     })),
     ...(file?.format === "html" ? [{ id: "render-selected", label: "Render selected HTML", description: "Open the sandboxed offline preview; scripts are disabled.", keywords: "preview render html page browser", run: () => { setMode("Inspect"); setView("Render"); } }] : []),
+    { id: "collect-website", label: "Collect website evidence", description: "Guide browser recording and offline HAR import.", keywords: "website capture har devtools collect", run: selectCollection },
     ...(file?.format === "wasm" ? [{ id: "inspect-wasm", label: "Open WebAssembly workbench", description: "Search indexed instructions, rename functions with aliases, inspect direct calls, and navigate to original module bytes.", keywords: "wasm webassembly disassemble instruction function rename alias references", run: () => { setMode("Inspect"); setView("Wasm"); } }] : []),
     ...(file && ["html", "javascript", "css", "json", "sourcemap"].includes(file.format) ? [{ id: "beautify-selected", label: "Beautify selected evidence", description: "Create a formatted view in a worker while preserving the imported bytes.", keywords: "format prettify beautified source", disabledReason: beautifying ? "Beautify is already in progress." : evidenceSize(file) > 5 * 1024 * 1024 ? "Beautify supports sources up to 5 MiB." : undefined, run: () => { setMode("Inspect"); startBeautify(); } }] : []),
     {
@@ -1093,9 +1110,9 @@ export function App() {
     },
   ];
   const closeTabCommand = commands.find((command) => command.id === "close-file");
-  if (closeTabCommand && selected === WELCOME_TAB_ID) {
-    closeTabCommand.label = "Close Welcome tab";
-    closeTabCommand.description = "Close the Welcome tab; it can be reopened from this palette.";
+  if (closeTabCommand && (selected === WELCOME_TAB_ID || selected === COLLECTION_TAB_ID)) {
+    closeTabCommand.label = selected === COLLECTION_TAB_ID ? "Close collection guide tab" : "Close Welcome tab";
+    closeTabCommand.description = selected === COLLECTION_TAB_ID ? "Close the collection guide and keep imported evidence; reopen it from this palette." : "Close the Welcome tab; it can be reopened from this palette.";
     closeTabCommand.keywords += " welcome";
   }
   const filteredCommands = commands.filter((command) =>
@@ -1187,7 +1204,7 @@ export function App() {
         <button
           disabled={busy || !ready}
           onClick={() => folderInput.current?.click()}
-          title="Import a website folder with relative paths. Choose an entrypoint before running it."
+          title="Import a website folder with relative paths. Relative paths are preserved for static preview."
         >
           Import site folder
         </button>
@@ -1366,6 +1383,7 @@ export function App() {
             <button onClick={() => archiveInput.current?.click()}>
               Open saved project
             </button>
+            <button onClick={selectCollection}>Collect website evidence</button>
             <button onClick={() => harInput.current?.click()}>Import HAR capture</button>
           </div>
           <div className="overview-cards">
@@ -1421,14 +1439,19 @@ export function App() {
           </details>
         </section>
       )}
+      {harAbort.current && <button onClick={() => harAbort.current?.abort()}>Cancel HAR import</button>}
       {mode === "Network" && <NetworkView
         sessions={project.sessions || []}
         files={project.files}
         onOpenEvidence={selectFile}
+        onCollect={selectCollection}
+        onLinkEvidence={(sessionId, requestId, evidenceId) => update(p => ({ ...p, sessions: p.sessions?.map(s => s.id === sessionId ? { ...s, requests: s.requests?.map(r => r.id === requestId ? { ...r, analystEvidenceId: evidenceId || undefined } : r) } : s) }))}
+        onBeautify={(evidence) => { selectFile(evidence); setPendingBeautify(evidence.id); }}
+        onReferences={(evidence) => { setLocation({ fileId: evidence.id, start: 0, end: 0 }); setResearchTab("Cross-references"); setMode("Research"); }}
         onImportHar={() => harInput.current?.click()}
       />}
       {mode === "Observations" && <SavedObservations project={project} />}
-      {mode === "Research" && <ResearchView project={project} selection={location} update={update} navigate={navigate} />}
+      {mode === "Research" && <ResearchView project={project} selection={location} initialTab={researchTab} update={update} navigate={navigate} />}
       {mode === "Report" && (
         <section className="guided-overview">
           <h1>Investigation report</h1>
@@ -1535,6 +1558,7 @@ export function App() {
           <div className="file-tabbar">
             <div className="evidence-tabs" role="tablist" aria-label="Open editor tabs">
               {openTabs.map((id) => {
+                if (id === COLLECTION_TAB_ID) return <div className={`evidence-tab ${selected === id ? "active" : ""}`} key={id}><button role="tab" aria-selected={selected === id} onClick={selectCollection}>Collect website evidence</button><button className="evidence-tab-close" aria-label="Close collection guide tab" onClick={() => closeFileTab(id)}>x</button></div>;
                 if (id === WELCOME_TAB_ID) {
                   return <div className={`evidence-tab welcome-tab ${selected === id ? "active" : ""}`} key={id}>
                     <button role="tab" aria-selected={selected === id} aria-label="Welcome" title="Switch to Welcome" onClick={selectWelcome}>
@@ -1579,7 +1603,7 @@ export function App() {
                     ...(file.format === "html" ? ["Render" as View] : []),
                   ] as View[]
                 ).map((v) => (
-                  <Tooltip key={v} content={{Original:"View the imported source. Click the editor gutter to set or clear a breakpoint.",Hex:"Inspect the original bytes and select byte ranges.",Beautified:"Read a formatted copy; its positions do not map exactly to original evidence.",AST:"Browse the parsed syntax tree and jump to source locations.",WAT:"Read the WebAssembly text representation and navigate its sections.",Wasm:"Browse indexed instructions, imports, exports, and direct call references. Rename functions with project-wide analyst aliases; the original module is unchanged.",Graph:"Explore links between files, functions, calls, and findings.",Decode:"Apply reversible decoding steps while retaining the original evidence.",Render:"Build an offline sandboxed HTML preview with scripts disabled."}[v]}><button
+                  <Tooltip key={v} content={{Original:"View the imported source. Select original bytes to add an annotation.",Hex:"Inspect the original bytes and select byte ranges.",Beautified:"Read a formatted copy; its positions do not map exactly to original evidence.",AST:"Browse the parsed syntax tree and jump to source locations.",WAT:"Read the WebAssembly text representation and navigate its sections.",Wasm:"Browse indexed instructions, imports, exports, and direct call references. Rename functions with project-wide analyst aliases; the original module is unchanged.",Graph:"Explore links between files, functions, calls, and findings.",Decode:"Apply reversible decoding steps while retaining the original evidence.",Render:"Build an offline sandboxed HTML preview with scripts disabled."}[v]}><button
                     role="tab"
                     aria-selected={view === v}
                     className={view === v ? "active" : ""}
@@ -1932,6 +1956,8 @@ export function App() {
                 </button>
               </div>
             </>
+          ) : selected === COLLECTION_TAB_ID ? (
+            <CollectionGuide onImportHar={() => harInput.current?.click()} onImportFiles={() => filesInput.current?.click()} onImportFolder={() => folderInput.current?.click()} onInvestigate={() => setMode("Network")} captures={project.sessions?.length || 0} busy={busy} />
           ) : selected === WELCOME_TAB_ID ? (
             <div className="welcome">
               <img className="welcome-emblem" src={whidraLogoUrl} alt="Whidra hydra and gear logo" />
@@ -1947,6 +1973,7 @@ export function App() {
               >
                 ＋ Import evidence files
               </button>
+              <button onClick={selectCollection}>Collect website evidence</button>
               <span className="drop-hint">
                 or drop files anywhere · up to 25 MiB each
               </span>

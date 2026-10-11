@@ -8,10 +8,10 @@ import { runResearchJob } from "./research-runtime";
 
 const labels: Record<Recipe, string> = { "fold-strings": "Fold constant strings", "literal-constants": "Simplify literal expressions", "static-branches": "Simplify constant branches", "remove-debugger": "Remove debugger statements" };
 type Draft = { file: Evidence; hash: string; preview: TransformPreview; inputRange: { start: number; end: number } };
-export function ResearchView({ project, selection, update, navigate }: {
-  project: Project; selection?: Location; update: (fn: (project: Project) => Project) => void; navigate: (location: Location) => void;
+export function ResearchView({ project, selection, update, navigate, initialTab }: {
+  initialTab?: string; project: Project; selection?: Location; update: (fn: (project: Project) => Project) => void; navigate: (location: Location) => void;
 }) {
-  const [tab, setTab] = useState("Transforms");
+  const [tab, setTab] = useState(initialTab || "Transforms");
   const [fileId, setFileId] = useState("");
   const [recipe, setRecipe] = useState<Recipe>("literal-constants");
   const [scope, setScope] = useState("file");

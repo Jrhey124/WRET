@@ -183,7 +183,7 @@ export function removeEvidence(project: Project, evidenceId: string): Project {
     })),
     transformations: (project.transformations || []).filter((entry) => entry.outputEvidenceId !== evidenceId).map((entry) => entry.parentEvidenceId === evidenceId ? { ...entry, parentUnavailable: true } : entry),
     wasmAliases: removedModuleHash && !remainingModuleHashes.has(removedModuleHash) ? (project.wasmAliases || []).filter((alias) => alias.moduleHash !== removedModuleHash) : project.wasmAliases || [],
-    sessions: project.sessions?.map((session) => ({ ...session, requests: session.requests?.map((request) => request.evidenceId === evidenceId ? { ...request, evidenceId: undefined, truncated: true } : request) })),
+    sessions: project.sessions?.map((session) => ({ ...session, requests: session.requests?.map((request) => ({ ...request, ...(request.evidenceId === evidenceId ? { evidenceId: undefined, truncated: true, bodyAvailability: "deleted" as const } : {}), ...(request.analystEvidenceId === evidenceId ? { analystEvidenceId: undefined } : {}) })) })),
     notes: project.notes.filter((note) => note.location.fileId !== evidenceId),
     decodes: project.decodes.filter((decode) => decode.location.fileId !== evidenceId),
     breakpoints: (project.breakpoints || []).filter((breakpoint) => {

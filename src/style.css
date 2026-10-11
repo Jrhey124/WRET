@@ -1431,3 +1431,25 @@ input,select,textarea { background:#fff; color:#273139; border-color:#ccd3d7; }
   .brand-logo { width: 36px; height: 36px; flex-basis: 36px; }
   .brand-name { font-size: 17px; }
 }
+
+.collection-guide { padding:24px; max-width:900px; margin:0 auto; overflow:auto; width:100%; box-sizing:border-box; }
+.collection-guide h1 { font-size:24px; }.collection-guide h2 { font-size:18px; }
+.collection-guide p, .collection-guide li { font-size:13px; line-height:1.7; }
+.collection-guide input { width:min(100%,560px); display:block; margin:8px 0; }
+.collection-guide button, .collection-guide select, .collection-guide input { min-height:32px; }
+.collection-steps { display:flex; flex-wrap:wrap; gap:8px; margin:20px 0; }
+.collection-steps [aria-current=step] { background:#edf4f7; border-color:#40677c; font-weight:600; }
+.capture-summary { max-height:120px; overflow:auto; font-size:12px; padding:8px; }.capture-summary dl { display:flex; flex-wrap:wrap; gap:12px; }.capture-summary dd { margin:0; font-weight:600; }
+.network-toolbar { flex-wrap:wrap; }.network-toolbar select { max-width:240px; }.network-table tbody tr:not([aria-hidden]) { height:64px; }.network-table td:first-child { max-width:300px; }.network-row-select { height:48px; overflow:hidden; }.network-row-select small { white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }.network-details select { width:100%; }
+
+@media (max-width:800px) {
+  .app { height:auto; min-height:100vh; min-width:0; overflow:visible; }
+  .workbench { grid-template-columns:minmax(0,1fr); grid-template-rows:auto minmax(400px,auto) auto; flex:none; }
+  .explorer { max-height:240px; min-height:160px; }
+  .center-pane { min-height:400px; }
+  .inspector { min-height:240px; max-height:480px; }
+  .collection-guide { min-height:360px; overflow:visible; padding:16px; }
+  .topbar { height:auto; min-height:68px; flex-wrap:wrap; }
+  .projectbar { height:auto; min-height:49px; flex-wrap:wrap; }
+  .network-workspace { min-height:700px; }
+}

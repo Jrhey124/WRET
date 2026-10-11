@@ -1,4 +1,4 @@
-import type { CapturedRequest } from "./debug-types";
+import type { CapturedRequest, CaptureCoverage, BodyAvailability } from "./debug-types";
 import { safeCapturedHeaderList, safeCapturedUrl } from "./capture";
 
 export const HAR_LIMIT = 25 * 1024 * 1024;
@@ -17,19 +17,49 @@ export interface HarImport {
   requests: CapturedRequest[];
   resources: HarResource[];
   truncated: boolean;
+  coverage: CaptureCoverage;
 }
 
-function decodeHarContent(content: any): Uint8Array | undefined {
-  if (!content || typeof content.text !== "string") return;
+function decodeHarContent(content: any): { bytes?: Uint8Array; status: BodyAvailability } {
+  if (!content || typeof content.text !== "string") return { status: "missing" };
+  const text = content.text;
+  if (content.encoding && content.encoding !== "base64") return { status: "invalid" };
   try {
     if (content.encoding === "base64") {
-      if (content.text.length > Math.ceil(HAR_BODY_LIMIT * 4 / 3) + 8) return;
-      return Uint8Array.from(atob(content.text), (character) => character.charCodeAt(0));
+      const compact = text.replace(/\s/g, "");
+      if ((compact.length % 4 !== 0 || !/^[A-Za-z0-9+/]*={0,2}$/.test(compact))) return { status: "invalid" };
+      const partial = compact.length > Math.ceil(HAR_BODY_LIMIT / 3) * 4;
+      const bounded = compact.slice(0, Math.ceil(HAR_BODY_LIMIT / 3) * 4);
+      const bytes = Uint8Array.from(atob(bounded), c => c.charCodeAt(0));
+      return { bytes: bytes.subarray(0, HAR_BODY_LIMIT), status: partial || bytes.length > HAR_BODY_LIMIT ? "truncated" : "retained" };
     }
-    return new TextEncoder().encode(content.text);
-  } catch {
-    return;
-  }
+    const bytes = new Uint8Array(Math.min(HAR_BODY_LIMIT, text.length * 3));
+    const { read, written } = new TextEncoder().encodeInto(text, bytes);
+    return { bytes: bytes.subarray(0, written), status: read < text.length ? "truncated" : "retained" };
+  } catch { return { status: "invalid" }; }
+}
+
+export function captureCoverage(requests: CapturedRequest[], invalidEntries = 0, skippedEntries = 0): CaptureCoverage {
+  return {
+    importedRequests: requests.length,
+    retainedBodies: requests.filter(r => r.bodyAvailability === "retained" || r.bodyAvailability === "truncated").length,
+    absentBodies: requests.filter(r => r.bodyAvailability === "missing" || r.bodyAvailability === "deleted").length,
+    truncatedBodies: requests.filter(r => r.bodyAvailability === "truncated").length,
+    invalidBodies: requests.filter(r => r.bodyAvailability === "invalid").length,
+    invalidEntries,
+    omittedResources: requests.filter(r => r.bodyAvailability === "budget-omitted").length,
+    skippedEntries,
+  };
+}
+
+function initiator(entry: any): CapturedRequest["initiator"] {
+  const value = entry._initiator;
+  if (!value || typeof value !== "object") return;
+  const frame = Array.isArray(value.stack?.callFrames) ? value.stack.callFrames[0] : value;
+  const url = safeCapturedUrl(frame?.url);
+  const line = Number.isSafeInteger(frame?.lineNumber) && frame.lineNumber >= 0 && frame.lineNumber < 10000000 ? frame.lineNumber + 1 : undefined;
+  const column = Number.isSafeInteger(frame?.columnNumber) && frame.columnNumber >= 0 && frame.columnNumber < 10000000 ? frame.columnNumber + 1 : undefined;
+  return { type: typeof value.type === "string" ? value.type.slice(0, 64) : undefined, url: /^https?:\/\//i.test(url) ? url : undefined, line, column };
 }
 
 /** Parse a HAR entirely offline, bounding retained bodies and redacting common secrets. */
@@ -46,21 +76,27 @@ export function parseHar(source: string): HarImport {
   if (!Array.isArray(entries)) throw new Error("HAR log.entries is missing or invalid.");
   const requests: CapturedRequest[] = [];
   const resources: HarResource[] = [];
+  let invalidEntries = 0;
   let truncated = entries.length > HAR_ENTRY_LIMIT;
   for (const [index, entry] of entries.slice(0, HAR_ENTRY_LIMIT).entries()) {
     const request = entry?.request;
     const response = entry?.response;
     const url = safeCapturedUrl(request?.url);
-    if (!url || !/^https?:\/\//i.test(url) || !request || !response) continue;
+    let validUrl = false;
+    try { validUrl = ["http:", "https:"].includes(new URL(url).protocol); } catch { /* malformed destinations are skipped, never contacted */ }
+    if (!validUrl || !request || !response || typeof response !== "object" || Array.isArray(response)) { invalidEntries++; continue; }
     const requestId = `har:${index + 1}`;
     const resourceId = index + 1;
-    const body = decodeHarContent(response.content);
+    const decoded = decodeHarContent(response.content);
+    const body = decoded.bytes;
     const contentSize = Number(response.content?.size);
     const bodyTruncated = Boolean(
-      (body && body.length > HAR_BODY_LIMIT) || contentSize > HAR_BODY_LIMIT,
+      decoded.status === "truncated",
     );
     const responseBytes = body ? body.subarray(0, HAR_BODY_LIMIT) : undefined;
     const record: CapturedRequest = {
+      bodyAvailability: decoded.status,
+      initiator: initiator(entry),
       id: requestId,
       requestId,
       sequence: index + 1,
@@ -89,5 +125,5 @@ export function parseHar(source: string): HarImport {
         truncated: bodyTruncated,
       });
   }
-  return { requests, resources, truncated };
+  return { requests, resources, truncated, coverage: captureCoverage(requests, invalidEntries, Math.max(0, entries.length - HAR_ENTRY_LIMIT)) };
 }

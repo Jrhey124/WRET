@@ -1,3 +1,4 @@
+import { safeCapturedUrl } from "./capture";
 import {
   evidenceSize,
   type Evidence,
@@ -597,6 +598,11 @@ export async function importProject(content: string): Promise<Project> {
           fail("runtime observation");
         previous = event.sequence;
       }
+      if (session.captureSource !== undefined && (!session.captureSource || session.captureSource.kind !== "har" || !str(session.captureSource.filename, 500))) fail("capture provenance");
+      if (session.coverage !== undefined) {
+        const keys = ["importedRequests", "retainedBodies", "absentBodies", "truncatedBodies", "invalidBodies", "invalidEntries", "omittedResources", "skippedEntries"];
+        if (!session.coverage || typeof session.coverage !== "object" || keys.some(k => !Number.isSafeInteger(session.coverage[k]) || session.coverage[k] < 0 || session.coverage[k] > 10000000)) fail("capture coverage");
+      }
       if ((data.schema === 3 || data.schema === 4 || data.schema === 5) && session.requests !== undefined) {
         if (!array(session.requests, 50000)) fail("captured requests");
         for (const request of session.requests) {
@@ -612,6 +618,9 @@ export async function importProject(content: string): Promise<Project> {
             (request.durationMs !== undefined && (!Number.isSafeInteger(request.durationMs) || request.durationMs < 0)) ||
             (request.evidenceId !== undefined && (!str(request.evidenceId, 200) || !sizes.has(request.evidenceId))) ||
             (request.blockedReason !== undefined && !str(request.blockedReason, 1000)) ||
+            (request.analystEvidenceId !== undefined && (!str(request.analystEvidenceId, 200) || !sizes.has(request.analystEvidenceId))) ||
+            (request.bodyAvailability !== undefined && !["retained", "missing", "invalid", "truncated", "budget-omitted", "deleted"].includes(request.bodyAvailability)) ||
+            (request.initiator !== undefined && (!request.initiator || (request.initiator.url !== undefined && !str(request.initiator.url, 8192)) || (request.initiator.type !== undefined && !str(request.initiator.type, 64)) || ["line", "column"].some(k => request.initiator[k] !== undefined && (!Number.isSafeInteger(request.initiator[k]) || request.initiator[k] < 1 || request.initiator[k] > 10000000)))) ||
             (request.truncated !== undefined && typeof request.truncated !== "boolean")
           ) fail("captured request record");
           for (const key of ["requestHeaders", "responseHeaders"])
@@ -739,9 +748,12 @@ export function report(project: Project): string {
       (t) => `- ${t.id}@${t.version} · SHA-256 ${t.integrity}`,
     ),
     "",
-    "## Runtime investigations",
+    "## Captures and saved observations",
     ...(project.sessions || []).flatMap((s) => [
       `- ${escapeMarkdown(s.target)} · ${s.status} · ${s.createdAt}${s.truncated ? " · capture truncated" : ""}`,
+      `  - Capture source: ${escapeMarkdown(s.captureSource?.filename || "Not recorded")}`,
+      `  - Coverage: ${s.coverage ? escapeMarkdown(JSON.stringify(s.coverage)) : "Not recorded"}`,
+      ...(s.requests || []).map(r => `  - ${escapeMarkdown(r.method)} ${escapeMarkdown(safeCapturedUrl(r.url))}; body: ${r.bodyAvailability || "Not recorded"}${r.analystEvidenceId ? "; analyst association: " + escapeMarkdown(fileName(r.analystEvidenceId)) : ""}`),
       ...s.observations.map(
         (o) =>
           `  - ${o.sequence} · ${o.time} · ${escapeMarkdown(o.kind)}: ${escapeMarkdown(JSON.stringify(portableObservation(o.data)))}`,

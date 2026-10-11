@@ -1,4 +1,15 @@
 export const CAPTURE_LIMIT = 50 * 1024 * 1024;
+export type BodyAvailability = "retained" | "missing" | "invalid" | "truncated" | "budget-omitted" | "deleted";
+export interface CaptureCoverage {
+  importedRequests: number;
+  retainedBodies: number;
+  absentBodies: number;
+  truncatedBodies: number;
+  invalidBodies: number;
+  invalidEntries: number;
+  omittedResources: number;
+  skippedEntries: number;
+}
 export interface Breakpoint {
   id: string;
   url: string;
@@ -41,6 +52,8 @@ export interface CapturedRequest {
   redirectFrom?: string;
   evidenceId?: string;
   truncated?: boolean;
+  bodyAvailability?: BodyAvailability;
+  analystEvidenceId?: string;
 }
 export interface DebugSession {
   id: string;
@@ -55,5 +68,7 @@ export interface DebugSession {
   truncated: boolean;
   wasmBridgeMonitor?: boolean;
   wasmModuleCapture?: boolean;
+  captureSource?: { kind: "har"; filename: string };
+  coverage?: CaptureCoverage;
   wasmStringDecoders?: WasmStringDecoder[];
 }

@@ -9,6 +9,7 @@ test("Whidra logo, Welcome tab, and Investigation tabs remain readable and keybo
   await home.click();
   const welcomeLogo = page.locator(".welcome-emblem");
   await expect(welcomeLogo).toBeVisible();
+  await expect.poll(() => page.locator(".welcome-emblem").evaluate(element => (element as HTMLImageElement).naturalWidth)).toBeGreaterThan(0);
   const logoSize = await welcomeLogo.evaluate((element) => {
     const bounds = element.getBoundingClientRect();
     return { width: bounds.width, height: bounds.height, top: bounds.top, loaded: (element as HTMLImageElement).naturalWidth > 0 };
