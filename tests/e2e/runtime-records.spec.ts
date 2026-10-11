@@ -114,7 +114,7 @@ test("runtime records remain ordered, sanitize handles, and support annotations 
     .getByRole("button", { name: "Bookmark and annotate observation" })
     .click();
   await expect(page.locator(".file-row")).toHaveCount(3);
-  await page.getByRole("button", { name: "Notes", exact: true }).click();
+  await page.getByRole("tab", { name: "Notes", exact: true }).click();
   await expect(page.locator(".note-card")).toContainText(
     "Runtime script observation",
   );
@@ -126,7 +126,7 @@ test("runtime records remain ordered, sanitize handles, and support annotations 
   const archive = JSON.parse(
     await readFile((await (await downloading).path())!, "utf8"),
   );
-  expect(archive.schema).toBe(4);
+  expect(archive.schema).toBe(5);
   expect(archive.sessions[0].observations.map((o: any) => o.sequence)).toEqual([
     1, 2, 3, 4, 5, 6,
   ]);
@@ -139,6 +139,6 @@ test("runtime records remain ordered, sanitize handles, and support annotations 
   await expect(page.locator(".statusbar")).not.toContainText("Saved in this browser");
   await page.reload();
   await expect(page.locator(".file-row")).toHaveCount(3);
-  await page.getByRole("button", { name: "Notes", exact: true }).click();
+  await page.getByRole("tab", { name: "Notes", exact: true }).click();
   await expect(page.locator(".note-card")).toHaveCount(1);
 });

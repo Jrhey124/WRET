@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { runAnalysis } from "../../src/runtime";
+import { runAnalysis, PinnedToolUnavailableError } from "../../src/runtime";
 import {
   sha256,
   type ToolPin,
@@ -88,14 +88,14 @@ describe("worker lifecycle", () => {
         () => {},
         new AbortController().signal,
       ),
-    ).rejects.toThrow("Pinned tool");
+    ).rejects.toBeInstanceOf(PinnedToolUnavailableError);
     expect(terminate).not.toHaveBeenCalled();
   });
   it("terminates a successful worker", async () => {
     const { tool, terminate } = await environment("result");
     expect(
       await runAnalysis(file, tool, () => {}, new AbortController().signal),
-    ).toEqual({ hash: "ok" });
+    ).toEqual({ hash: "ok", tool });
     expect(terminate).toHaveBeenCalledOnce();
   });
 });

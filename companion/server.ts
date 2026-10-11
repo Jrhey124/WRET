@@ -26,7 +26,8 @@ let liveState: any,
   sessionTarget = "files";
 function event(kind: string, data: any) {
   let payload = JSON.stringify(data ?? null);
-  if (Buffer.byteLength(payload) > 2 * 1024 * 1024) {
+  const payloadLimit = kind === "wasmModule" ? 36 * 1024 * 1024 : 2 * 1024 * 1024;
+  if (Buffer.byteLength(payload) > payloadLimit) {
     kind = "diagnostic";
     payload = JSON.stringify("Oversized observation omitted");
     data = JSON.parse(payload);
@@ -107,6 +108,16 @@ async function body(request: http.IncomingMessage, maximum = 64 * 1024) {
   return JSON.parse(Buffer.concat(chunks).toString());
 }
 function validateInput(input: SessionInput) {
+  if (input?.monitorWasmBridge !== undefined && typeof input.monitorWasmBridge !== "boolean")
+    throw new Error("Invalid WebAssembly monitor option");
+  if (input?.captureWasmModules !== undefined && typeof input.captureWasmModules !== "boolean")
+    throw new Error("Invalid WebAssembly module capture option");
+  if (input?.wasmStringDecoders !== undefined && (!Array.isArray(input.wasmStringDecoders) || input.wasmStringDecoders.length > 20))
+    throw new Error("Invalid WebAssembly string decoder rules");
+  for (const rule of input?.wasmStringDecoders || []) {
+    if (!rule || !["js-to-wasm", "wasm-to-js"].includes(rule.direction) || typeof rule.functionName !== "string" || !rule.functionName.trim() || rule.functionName.length > 200 || typeof rule.memoryName !== "string" || !rule.memoryName.trim() || rule.memoryName.length > 200 || !Number.isSafeInteger(rule.pointerArgument) || rule.pointerArgument < 0 || rule.pointerArgument > 15 || (rule.lengthArgument !== undefined && (!Number.isSafeInteger(rule.lengthArgument) || rule.lengthArgument < 0 || rule.lengthArgument > 15 || rule.lengthArgument === rule.pointerArgument)))
+      throw new Error("Invalid WebAssembly string decoder rule");
+  }
   if (
     input?.exceptionState !== undefined &&
     !["none", "uncaught", "all"].includes(input.exceptionState)
@@ -413,7 +424,7 @@ if (process.argv.includes("--check")) {
 }
 await cleanOrphans();
 server.listen(port, "127.0.0.1", () =>
-  console.log(`WRET companion: ${origin}`),
+  console.log(`Whidra companion: ${origin}`),
 );
 let exiting = false;
 async function shutdown() {

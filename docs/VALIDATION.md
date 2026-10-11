@@ -19,6 +19,8 @@ Verified on 2026-10-05 against the implemented README MVP. Future-roadmap items 
 | JavaScript, HTML, CSS, JSON, source maps, WASM and opaque files | Format detection, source/hex viewers, SHA-256 and ASCII strings; unit and browser fixtures |
 | JS formatting, syntax-tree inspection, outlines, references and calls | Acorn, eslint-scope, Prettier; normal/minified/obfuscated/malformed code, lexical shadowing, reassignment and unresolved calls tested |
 | WASM sections, imports, exports, functions and navigable WAT | WABT worker; stripped-name and truncated fixtures; browser WAT-to-original-hex navigation |
+| WebAssembly instruction index, original offsets, direct-call references, and analyst aliases | Bounded v1 reader; virtualized Inspect view; aliases keyed by module SHA-256 and function index; schema 5 round trip |
+| Runtime WebAssembly capture and JS boundary observations | Explicit full-module capture up to 25 MiB; opt-in wrappers for supported instantiate paths; direct access and internal calls remain uncovered |
 | Search, indicators and relationship graph | Project-wide byte search, URL/host/domain/API patterns, clickable graph nodes; browser workflow and binary search tests |
 | Comments, bookmarks, labels and finding status | Evidence-linked annotation records; label/status navigation, persistence and archive round trips |
 | Reversible decoding without execution | Base64/hex/URL unit tests; input/output history, restore-input control and browser decoding workflow |

@@ -1,7 +1,7 @@
 {
-  "name": "wret",
+  "name": "whidra",
   "version": "1.0.0",
-  "description": "WRET: a browser-based tool for inspecting web files and debugging their behavior.",
+  "description": "Whidra: a unified browser-based reverse engineering suite for inspecting web code, tracing behavior, and debugging.",
   "scripts": {
     "companion:build": "node scripts/build-companion.mjs",
     "companion": "npm run build && npm run companion:build && node dist-companion/server.mjs",

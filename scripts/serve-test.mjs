@@ -14,7 +14,7 @@ const types = {
   ".woff2": "font/woff2",
   ".wasm": "application/wasm",
 };
-http
+const testServer = http
   .createServer(async (req, res) => {
     res.setHeader("Content-Security-Policy", csp);
     res.setHeader("X-Content-Type-Options", "nosniff");
@@ -48,7 +48,17 @@ http
       res.writeHead(404);
       res.end();
     }
-  })
-  .listen(4173, "127.0.0.1", () =>
-    console.log("WRET production test server: http://127.0.0.1:4173"),
-  );
+  });
+testServer.listen(4173, "127.0.0.1", () =>
+  console.log("Whidra production test server: http://127.0.0.1:4173"),
+);
+const shutdown = () => {
+  const forceExit = setTimeout(() => {
+    testServer.closeAllConnections?.();
+    process.exit(0);
+  }, 1500);
+  forceExit.unref();
+  testServer.close(() => process.exit(0));
+};
+process.once("SIGINT", shutdown);
+process.once("SIGTERM", shutdown);

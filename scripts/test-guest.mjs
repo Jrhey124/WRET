@@ -97,7 +97,7 @@ try {
       '<script src="/patch.js"></script><script src="/app.js"></script><iframe src="/frame.html"></iframe>',
     "patch.js": 'function editable(){return 1;} window.editable=editable;',
     "app.js":
-      'const marker = "fresh";\nconsole.log(marker);\nnew Worker("worker.js");\nfetch("https://example.com/");\nnew WebSocket("wss://example.com/");\nfetch("https://approved.example/body").then(r=>r.text()).then(text=>console.log(text));',
+      'const marker = "fresh";\nconsole.log(marker);\nconst wasmBytes=[0,97,115,109,1,0,0,0,1,10,2,96,1,127,0,96,0,1,127,2,11,1,3,101,110,118,3,108,111,103,0,0,3,2,1,1,7,10,1,6,97,110,115,119,101,114,0,1,10,10,1,8,0,65,123,16,0,65,0,11]; WebAssembly.instantiate(new Uint8Array(wasmBytes),{env:{log:value=>console.log("wasm imported",value)}}).then(({instance})=>console.log("wasm result",instance.exports.answer()));\nnew Worker("worker.js");\nfetch("https://example.com/");\nnew WebSocket("wss://example.com/");\nfetch("https://approved.example/body").then(r=>r.text()).then(text=>console.log(text));',
     "worker.js": 'console.log("worker captured");',
     "frame.html": '<script>console.log("frame captured")</script>',
   };
@@ -106,6 +106,7 @@ try {
     input: {
       target: "files",
       entry: "site/index.html",
+      monitorWasmBridge: true,
       approvals: [],
       breakpoints: [
         {
@@ -168,6 +169,9 @@ try {
     "stepped pause",
   );
   await command({ action: "resume", target: paused.data.target });
+  const wasmToJs = await wait((e) => e.kind === "wasmBridge" && e.data.phase === "enter" && e.data.direction === "wasm-to-js", "Wasm-to-JavaScript bridge call");
+  assert.equal(wasmToJs.data.args[0], 123);
+  await wait((e) => e.kind === "wasmBridge" && e.data.phase === "enter" && e.data.direction === "js-to-wasm" && e.data.function === "answer", "JavaScript-to-Wasm bridge call");
   await wait(
     (e) => e.kind === "blocked" && e.data.url === "https://example.com/",
     "blocked HTTP request",

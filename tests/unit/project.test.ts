@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import "fake-indexeddb/auto";
 import {
   exportProject,
@@ -13,7 +13,7 @@ import {
   readEvidenceRange,
 } from "../../src/storage";
 import { decodeValue, decompressValue } from "../../src/decoding";
-import { newProject, sha256, type Project } from "../../src/model";
+import { newProject, removeEvidence, sha256, type Project } from "../../src/model";
 import { analyzeFile } from "../../src/analyze";
 async function fixture(): Promise<Project> {
   const p = newProject();
@@ -85,6 +85,83 @@ describe("portable evidence and storage", () => {
     expect(await evidenceMetadata("chunked")).toEqual({ id: "chunked", name: "large.js", format: "javascript", byteLength: bytes.length, hash: await sha256(bytes) });
     expect(await readEvidenceRange("chunked", 262_140, 262_160)).toEqual(bytes.slice(262_140, 262_160));
   });
+  it("atomically removes evidence, chunks, analysis and linked records while preserving the rest through reload", async () => {
+    const project = newProject();
+    const dropBytes = new TextEncoder().encode("const removed = true;"), keepBytes = new TextEncoder().encode("const retained = true;"),
+      moduleBytes = Uint8Array.from([0, 97, 115, 109, 1, 0, 0, 0]), derivedBytes = new TextEncoder().encode("const derived = true;");
+    const moduleHash = await sha256(moduleBytes), parentHash = await sha256(keepBytes), derivedHash = await sha256(derivedBytes);
+    const drop = { id: "drop", name: "drop.js", format: "javascript" as const, bytes: dropBytes };
+    const keep = { id: "keep", name: "keep.js", format: "javascript" as const, bytes: keepBytes };
+    const module = { id: "module", name: "module.wasm", format: "wasm" as const, bytes: moduleBytes, hash: moduleHash };
+    project.files = [
+      { ...drop, result: await analyzeFile(drop) },
+      { ...keep, result: await analyzeFile(keep) },
+      { ...module, result: await analyzeFile(module) },
+      { id: "derived", name: "derived.js", format: "javascript", bytes: derivedBytes, hash: derivedHash, derivation: { sourceId: "keep", sourceHash: parentHash, recipe: "fixture", createdAt: "now", changes: 1 } },
+    ];
+    project.notes = [
+      { id: "drop-note", kind: "comment", text: "remove with file", location: { fileId: "drop", start: 0, end: 5 } },
+      { id: "keep-note", kind: "comment", text: "keep with file", location: { fileId: "keep", start: 0, end: 5 } },
+    ];
+    project.wasmAliases = [{ moduleHash, functionIndex: 0, name: "module_entry" }];
+    project.sessions = [{ id: "retained-session", createdAt: "now", target: "fixture", status: "stopped", approvals: [], observations: [{ sequence: 1, time: "now", kind: "console", data: { text: "retained" } }], capturedBytes: 0, truncated: false }];
+    project.transformations = [{ id: "derived-step", parentEvidenceId: "keep", parentHash, inputRange: { start: 0, end: keepBytes.length }, operation: "fixture", version: 1, parameters: {}, createdAt: "now", outputEvidenceId: "derived", outputHash: derivedHash, mapping: "unknown" }];
+    await saveProject(project);
+
+    await saveProject(removeEvidence(project, "drop"));
+    const afterFileDelete = await loadProject();
+    expect(afterFileDelete?.files.map((file) => file.id).sort()).toEqual(["keep", "module", "derived"].sort());
+    expect(afterFileDelete?.files.find((file) => file.id === "keep")?.bytes).toEqual(keepBytes);
+    expect(afterFileDelete?.notes.map((note) => note.id)).toEqual(["keep-note"]);
+    expect(afterFileDelete?.wasmAliases).toEqual(project.wasmAliases);
+    expect(afterFileDelete?.sessions?.[0]).toMatchObject(project.sessions![0]);
+    expect(await sha256(afterFileDelete!.files.find((file) => file.id === "keep")!.bytes)).toBe(parentHash);
+    const db = await new Promise<IDBDatabase>((resolve, reject) => {
+      const request = indexedDB.open("wret");
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => reject(request.error);
+    });
+    const stores = await new Promise<{ chunks: any[]; analyses: any[] }>((resolve, reject) => {
+      const tx = db.transaction(["projects", "contentChunks", "analysisResults"], "readonly");
+      const pointer = tx.objectStore("projects").get("current");
+      const chunks = tx.objectStore("contentChunks").getAll();
+      const analyses = tx.objectStore("analysisResults").getAll();
+      tx.oncomplete = () => resolve({ chunks: chunks.result, analyses: analyses.result.filter((record: any) => record.projectId === pointer.result.projectId) });
+      tx.onerror = () => reject(tx.error);
+    });
+    db.close();
+    const activeProjectId = (await loadProject())!.id;
+    expect(stores.chunks.filter((record) => record.projectId === activeProjectId && record.fileId === "drop")).toEqual([]);
+    expect(stores.analyses.some((record) => record.fileId === "drop")).toBe(false);
+
+    const withoutDerived = removeEvidence(afterFileDelete!, "derived");
+    await saveProject(withoutDerived);
+    expect((await loadProject())?.transformations).toEqual([]);
+    const withoutOthers = removeEvidence(withoutDerived, "keep");
+    const withoutModule = removeEvidence(withoutOthers, "module");
+    await saveProject(withoutModule);
+    const finalProject = await loadProject();
+    expect(finalProject?.files).toEqual([]);
+    expect(finalProject?.wasmAliases).toEqual([]);
+    expect(finalProject?.sessions?.[0]).toMatchObject(project.sessions![0]);
+  });
+  it("keeps the prior committed project intact when evidence chunk cleanup fails", async () => {
+    const project = newProject();
+    project.files = [{ id: "preserved", name: "preserved.js", format: "javascript", bytes: new TextEncoder().encode("still here") }];
+    await saveProject(project);
+    const originalDelete = IDBObjectStore.prototype.delete;
+    const deleteSpy = vi.spyOn(IDBObjectStore.prototype, "delete").mockImplementation(function (this: IDBObjectStore, query: IDBValidKey | IDBKeyRange) {
+      if (this.name === "contentChunks") throw new DOMException("simulated chunk cleanup failure", "DataError");
+      return originalDelete.call(this, query);
+    });
+    try {
+      await expect(saveProject({ ...project, files: [] })).rejects.toThrow("simulated chunk cleanup failure");
+    } finally {
+      deleteSpy.mockRestore();
+    }
+    expect((await loadProject())?.files.map((file) => file.id)).toEqual(["preserved"]);
+    expect(await readEvidenceRange("preserved", 0, 10)).toEqual(new TextEncoder().encode("still here"));
+  });
   it("round-trips schema 4 transformation ancestry and rejects a bad parent hash", async () => {
     const original = await fixture();
     const parent = original.files[0];
@@ -100,6 +177,20 @@ describe("portable evidence and storage", () => {
     const altered = JSON.parse(await exportProject(original));
     altered.transformations[0].parentHash = "f".repeat(64);
     await expect(importProject(JSON.stringify(altered))).rejects.toThrow("parent reference");
+  });
+  it("round-trips module-hash-scoped Wasm function aliases without changing bytes", async () => {
+    const project = newProject();
+    const bytes = Uint8Array.from([0,97,115,109,1,0,0,0,1,4,1,96,0,0,3,2,1,0,10,4,1,2,0,11]);
+    const evidence = { id: "module", name: "stripped.wasm", format: "wasm" as const, bytes };
+    const result = await analyzeFile(evidence);
+    const hash = await sha256(bytes);
+    project.files.push({ ...evidence, hash, result });
+    project.wasmAliases = [{ moduleHash: hash, functionIndex: 0, name: "entry_point" }];
+    const reopened = await importProject(await exportProject(project));
+    expect(reopened.schema).toBe(5);
+    expect(reopened.wasmAliases).toEqual(project.wasmAliases);
+    expect(reopened.files[0].bytes).toEqual(bytes);
+    expect(await sha256(reopened.files[0].bytes)).toBe(hash);
   });
   it("rejects tampered evidence, invalid ranges, duplicate IDs and external tool entries", async () => {
     const p = await fixture(),

@@ -11,6 +11,13 @@ export interface Observation {
   kind: string;
   data: unknown;
 }
+export interface WasmStringDecoder {
+  direction: "js-to-wasm" | "wasm-to-js";
+  functionName: string;
+  memoryName: string;
+  pointerArgument: number;
+  lengthArgument?: number;
+}
 export interface CapturedRequest {
   id: string;
   requestId: string;
@@ -46,6 +53,9 @@ export interface DebugSession {
   requests?: CapturedRequest[];
   capturedBytes: number;
   truncated: boolean;
+  wasmBridgeMonitor?: boolean;
+  wasmModuleCapture?: boolean;
+  wasmStringDecoders?: WasmStringDecoder[];
 }
 export interface Capabilities {
   available: boolean;
@@ -54,6 +64,9 @@ export interface Capabilities {
 }
 export interface SessionInput {
   exceptionState?: "none" | "uncaught" | "all";
+  monitorWasmBridge?: boolean;
+  captureWasmModules?: boolean;
+  wasmStringDecoders?: WasmStringDecoder[];
   target: string;
   entry?: string;
   files: { id: string; name: string; bytes: string }[];

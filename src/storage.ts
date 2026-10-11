@@ -29,7 +29,7 @@ export function validateProjectBudgets(project: Project): void {
     throw new Error(
       "Analysis results exceed the 24 MiB project result budget. Existing evidence and notes are preserved; split evidence into separate projects.",
     );
-  if (jsonSize([project.notes, project.decodes, project.transformations || []]) > ANNOTATION_STORAGE_LIMIT)
+  if (jsonSize([project.notes, project.decodes, project.transformations || [], project.wasmAliases || []]) > ANNOTATION_STORAGE_LIMIT)
     throw new Error(
       "Notes and decoding history exceed the 24 MiB project annotation budget. Export this project and begin a new investigation.",
     );
@@ -59,7 +59,7 @@ function database(): Promise<IDBDatabase> {
     request.onblocked = () =>
       reject(
         new Error(
-          "Storage is blocked by another WRET tab. Close it and retry.",
+          "Storage is blocked by another Whidra tab. Close it and retry. The browser storage name remains WRET for compatibility.",
         ),
       );
   });
@@ -113,7 +113,7 @@ export async function loadProject(): Promise<Project | undefined> {
 function normalizeLoadedProject(project: any): Project {
   return {
     ...project,
-    schema: 4,
+    schema: 5,
     sessions: (project.sessions || []).map((s: any) => ({
       ...s,
       status: ["starting", "running", "paused"].includes(s.status) ? "disconnected" : s.status,
@@ -224,6 +224,14 @@ export async function saveProject(project: Project): Promise<void> {
   try {
     await new Promise<void>((resolve, reject) => {
       const tx = db.transaction(["projects", "evidence", "contentChunks", "analysisResults", "projectRecords", "transformations", "annotations", "runtimeRecords"], "readwrite");
+      let settled = false;
+      const invalidatedEvidence = new Set<string>();
+      const fail = (error: unknown) => {
+        if (settled) return;
+        settled = true;
+        try { tx.abort(); } catch { /* The transaction may already have aborted. */ }
+        reject(error instanceof Error ? error : new Error(String(error)));
+      };
       const projectId = project.id;
       const evidenceStore = tx.objectStore("evidence");
       const chunksStore = tx.objectStore("contentChunks");
@@ -231,58 +239,82 @@ export async function saveProject(project: Project): Promise<void> {
       const transformStore = tx.objectStore("transformations");
       const oldEvidence = evidenceStore.index("byProject").getAll(projectId);
       oldEvidence.onsuccess = () => {
-        const previous = new Map<string, any>(oldEvidence.result.map((record: any) => [record.id, record]));
-        const currentIds = new Set(project.files.map((file) => file.id));
-        const changed = new Set<string>();
-        for (const file of project.files) {
-          const { bytes, result, ...metadata } = file;
-          const contentHash = hashes.get(file.id)!;
-          const before = previous.get(file.id);
-          const sameContent = before?.contentHash === contentHash && before?.byteLength === bytes.length;
-          evidenceStore.put({ ...metadata, projectId, byteLength: bytes.length, contentHash });
-          if (!sameContent) {
-            changed.add(file.id);
-            invalidateCachedEvidence(projectId, file.id);
-            for (let offset = 0, index = 0; offset < bytes.length; offset += CONTENT_CHUNK_SIZE, index++)
-              chunksStore.put({ projectId, fileId: file.id, index, bytes: bytes.slice(offset, Math.min(bytes.length, offset + CONTENT_CHUNK_SIZE)) });
+        try {
+          const previous = new Map<string, any>(oldEvidence.result.map((record: any) => [record.id, record]));
+          const currentIds = new Set(project.files.map((file) => file.id));
+          const changed = new Set<string>();
+          for (const file of project.files) {
+            const { bytes, result, ...metadata } = file;
+            const contentHash = hashes.get(file.id)!;
+            const before = previous.get(file.id);
+            const sameContent = before?.contentHash === contentHash && before?.byteLength === bytes.length;
+            evidenceStore.put({ ...metadata, projectId, byteLength: bytes.length, contentHash });
+            if (!sameContent) {
+              changed.add(file.id);
+              invalidatedEvidence.add(file.id);
+              for (let offset = 0, index = 0; offset < bytes.length; offset += CONTENT_CHUNK_SIZE, index++)
+                chunksStore.put({ projectId, fileId: file.id, index, bytes: bytes.slice(offset, Math.min(bytes.length, offset + CONTENT_CHUNK_SIZE)) });
+            }
+            if (result) analysisStore.put({ projectId, fileId: file.id, result });
+            else analysisStore.delete([projectId, file.id]);
           }
-          if (result) analysisStore.put({ projectId, fileId: file.id, result });
-          else analysisStore.delete([projectId, file.id]);
+          for (const [id] of previous) if (!currentIds.has(id)) { evidenceStore.delete([projectId, id]); analysisStore.delete([projectId, id]); invalidatedEvidence.add(id); }
+          const chunkCursor = chunksStore.openKeyCursor();
+          chunkCursor.onsuccess = () => {
+            try {
+              const cursor = chunkCursor.result;
+              if (!cursor) return;
+              const [chunkProject, fileId, index] = cursor.primaryKey as IDBValidKey[];
+              if (chunkProject === projectId) {
+                const file = project.files.find((candidate) => candidate.id === fileId);
+                const expectedChunks = file ? Math.ceil(file.bytes.length / CONTENT_CHUNK_SIZE) : 0;
+                if (!file || changed.has(String(fileId)) && Number(index) >= expectedChunks)
+                  chunksStore.delete(cursor.primaryKey);
+              }
+              cursor.continue();
+            } catch (error) {
+              fail(error);
+            }
+          };
+          chunkCursor.onerror = () => fail(chunkCursor.error || new Error("Could not clean up removed evidence chunks"));
+        } catch (error) {
+          fail(error);
         }
-        for (const [id] of previous) if (!currentIds.has(id)) { evidenceStore.delete([projectId, id]); analysisStore.delete([projectId, id]); invalidateCachedEvidence(projectId, id); }
-        const chunkCursor = chunksStore.openKeyCursor();
-        chunkCursor.onsuccess = () => {
-          const cursor = chunkCursor.result;
-          if (!cursor) return;
-          const [chunkProject, fileId, index] = cursor.key as IDBValidKey[];
-          if (chunkProject === projectId) {
-            const file = project.files.find((candidate) => candidate.id === fileId);
-            const expectedChunks = file ? Math.ceil(file.bytes.length / CONTENT_CHUNK_SIZE) : 0;
-            if (!file || changed.has(String(fileId)) && Number(index) >= expectedChunks) cursor.delete();
+      };
+      oldEvidence.onerror = () => fail(oldEvidence.error || new Error("Could not read existing evidence for save"));
+      try {
+        const lineage = (project as any).transformations || [];
+        for (const [index, value] of lineage.entries()) transformStore.put({ projectId, id: value.id || String(index), value });
+        const lineageIds = new Set(lineage.map((value: any, index: number) => value.id || String(index)));
+        const transformCursor = transformStore.openCursor();
+        transformCursor.onsuccess = () => {
+          try {
+            const cursor = transformCursor.result;
+            if (!cursor) return;
+            const key = cursor.key as IDBValidKey[];
+            if (key[0] === projectId && !lineageIds.has(key[1])) cursor.delete();
+            cursor.continue();
+          } catch (error) {
+            fail(error);
           }
-          cursor.continue();
         };
-      };
-      const lineage = (project as any).transformations || [];
-      for (const [index, value] of lineage.entries()) transformStore.put({ projectId, id: value.id || String(index), value });
-      const lineageIds = new Set(lineage.map((value: any, index: number) => value.id || String(index)));
-      const transformCursor = transformStore.openCursor();
-      transformCursor.onsuccess = () => {
-        const cursor = transformCursor.result;
-        if (!cursor) return;
-        const key = cursor.key as IDBValidKey[];
-        if (key[0] === projectId && !lineageIds.has(key[1])) cursor.delete();
-        cursor.continue();
-      };
-      tx.objectStore("annotations").put({ projectId, notes: project.notes, decodes: project.decodes });
-      tx.objectStore("runtimeRecords").put({ projectId, sessions: project.sessions || [], breakpoints: project.breakpoints || [] });
-      const { files: _files, transformations: _transformations, notes: _notes, decodes: _decodes, sessions: _sessions, breakpoints: _breakpoints, ...projectRecords } = project as any;
-      tx.objectStore("projectRecords").put({ projectId, project: projectRecords });
-      tx.objectStore("projects").put({ storageVersion: 2, projectId }, "current");
-      tx.oncomplete = () => resolve();
-      tx.onerror = () => reject(tx.error);
-      tx.onabort = () =>
-        reject(tx.error || new Error("Storage transaction aborted"));
+        transformCursor.onerror = () => fail(transformCursor.error || new Error("Could not clean up project transformations"));
+        tx.objectStore("annotations").put({ projectId, notes: project.notes, decodes: project.decodes });
+        tx.objectStore("runtimeRecords").put({ projectId, sessions: project.sessions || [], breakpoints: project.breakpoints || [] });
+        const { files: _files, transformations: _transformations, notes: _notes, decodes: _decodes, sessions: _sessions, breakpoints: _breakpoints, ...projectRecords } = project as any;
+        tx.objectStore("projectRecords").put({ projectId, project: projectRecords });
+        tx.objectStore("projects").put({ storageVersion: 2, projectId }, "current");
+        tx.oncomplete = () => {
+          if (settled) return;
+          settled = true;
+          for (const fileId of invalidatedEvidence) invalidateCachedEvidence(projectId, fileId);
+          resolve();
+        };
+        tx.onerror = () => fail(tx.error || new Error("Storage transaction failed"));
+        tx.onabort = () => fail(tx.error || new Error("Storage transaction aborted"));
+      } catch (error) {
+        fail(error);
+      }
     });
   } finally {
     db.close();
@@ -310,7 +342,7 @@ export async function exportProject(project: Project): Promise<string> {
   );
   return JSON.stringify({
     ...project,
-    schema: 4,
+    schema: 5,
     files,
     transformations: project.transformations || [],
     sessions: (project.sessions || []).map((s) => ({
@@ -351,14 +383,14 @@ export async function importProject(content: string): Promise<Project> {
     throw new Error("Project archive exceeds 300 MiB");
   const data = JSON.parse(content);
   const fail = (message: string): never => {
-    throw new Error(`Invalid WRET archive: ${message}`);
+    throw new Error(`Invalid Whidra or legacy WRET archive: ${message}`);
   };
   const str = (x: unknown, max = 100000) =>
     typeof x === "string" && x.length <= max;
   const array = (x: unknown, max = 50000) =>
     Array.isArray(x) && x.length <= max;
   if (
-    ![1, 2, 3, 4].includes(data?.schema) ||
+    ![1, 2, 3, 4, 5].includes(data?.schema) ||
     !str(data.id, 200) ||
     !str(data.name, 500) ||
     !str(data.createdAt, 100) ||
@@ -458,6 +490,20 @@ export async function importProject(content: string): Promise<Project> {
         r.diagnostics.some((s: unknown) => !str(s))
       )
         fail("invalid diagnostics");
+      if (r.wasmFunctions !== undefined) {
+        if (!array(r.wasmFunctions, 250_000)) fail("invalid Wasm function index");
+        for (let index = 0; index < r.wasmFunctions.length; index++) {
+          const fn = r.wasmFunctions[index];
+          if (!fn || fn.index !== index || typeof fn.imported !== "boolean" || !str(fn.name, 1000) || (fn.typeIndex !== undefined && (!Number.isSafeInteger(fn.typeIndex) || fn.typeIndex < 0)) || (fn.location !== undefined && (!location(fn.location) || fn.location.fileId !== file.id))) fail("invalid Wasm function");
+        }
+      }
+      if (r.wasmInstructions !== undefined) {
+        if (!array(r.wasmInstructions, 100_000)) fail("invalid Wasm instruction index");
+        for (const instruction of r.wasmInstructions) {
+          if (!instruction || !Number.isSafeInteger(instruction.functionIndex) || instruction.functionIndex < 0 || instruction.functionIndex >= (r.wasmFunctions || []).length || !Number.isSafeInteger(instruction.offset) || !Number.isSafeInteger(instruction.end) || instruction.offset < 8 || instruction.end <= instruction.offset || instruction.end > sizes.get(file.id)! || !str(instruction.opcode, 100) || !str(instruction.operands, 1000) || (instruction.callTarget !== undefined && (!Number.isSafeInteger(instruction.callTarget) || instruction.callTarget < 0 || instruction.callTarget >= (r.wasmFunctions || []).length))) fail("invalid Wasm instruction");
+        }
+      }
+      if (r.wasmCoverage !== undefined && (!r.wasmCoverage || !Number.isSafeInteger(r.wasmCoverage.decoded) || r.wasmCoverage.decoded < 0 || !Number.isSafeInteger(r.wasmCoverage.total) || r.wasmCoverage.total < r.wasmCoverage.decoded || (r.wasmCoverage.reason !== undefined && !str(r.wasmCoverage.reason, 2000)))) fail("invalid Wasm coverage");
       for (const key of ["ast", "formatted", "wat"])
         if (r[key] !== undefined && !str(r[key], 100 * 1024 * 1024))
           fail(`invalid ${key} view`);
@@ -503,7 +549,7 @@ export async function importProject(content: string): Promise<Project> {
       !/^[a-f0-9]{64}$/.test(tool.integrity)
     )
       fail("tool pin");
-  if (data.schema === 2 || data.schema === 3 || data.schema === 4) {
+  if (data.schema === 2 || data.schema === 3 || data.schema === 4 || data.schema === 5) {
     if (!array(data.sessions, 100) || !array(data.breakpoints, 1000))
       fail("runtime schema");
     const ids = new Set<string>();
@@ -531,6 +577,7 @@ export async function importProject(content: string): Promise<Project> {
         typeof session.truncated !== "boolean"
       )
         fail("runtime session");
+      if ((session.wasmBridgeMonitor !== undefined && typeof session.wasmBridgeMonitor !== "boolean") || (session.wasmModuleCapture !== undefined && typeof session.wasmModuleCapture !== "boolean") || (session.wasmStringDecoders !== undefined && (!array(session.wasmStringDecoders, 20) || session.wasmStringDecoders.some((rule: any) => !rule || !["js-to-wasm", "wasm-to-js"].includes(rule.direction) || !str(rule.functionName, 200) || !rule.functionName.trim() || !str(rule.memoryName, 200) || !rule.memoryName.trim() || !Number.isSafeInteger(rule.pointerArgument) || rule.pointerArgument < 0 || rule.pointerArgument > 15 || (rule.lengthArgument !== undefined && (!Number.isSafeInteger(rule.lengthArgument) || rule.lengthArgument < 0 || rule.lengthArgument > 15 || rule.lengthArgument === rule.pointerArgument)))))) fail("runtime Wasm monitoring options");
       ids.add(session.id);
       let previous = 0;
       for (const event of session.observations) {
@@ -545,7 +592,7 @@ export async function importProject(content: string): Promise<Project> {
           fail("runtime observation");
         previous = event.sequence;
       }
-      if ((data.schema === 3 || data.schema === 4) && session.requests !== undefined) {
+      if ((data.schema === 3 || data.schema === 4 || data.schema === 5) && session.requests !== undefined) {
         if (!array(session.requests, 50000)) fail("captured requests");
         for (const request of session.requests) {
           if (
@@ -588,7 +635,7 @@ export async function importProject(content: string): Promise<Project> {
     data.sessions = [];
     data.breakpoints = [];
   }
-  if (data.schema === 4) {
+  if (data.schema === 4 || data.schema === 5) {
     if (!array(data.transformations, 5000)) fail("transformation lineage");
     const seen = new Set<string>();
     const lineageByOutput = new Map<string, any>();
@@ -607,7 +654,16 @@ export async function importProject(content: string): Promise<Project> {
       }
     }
   } else data.transformations = [];
-  data.schema = 4;
+  const wasmAliases = data.schema === 5 ? data.wasmAliases : [];
+  if (!array(wasmAliases, 100_000)) fail("Wasm aliases");
+  const aliasKeys = new Set<string>();
+  for (const alias of wasmAliases) {
+    const key = alias && `${alias.moduleHash}:${alias.functionIndex}`;
+    if (!alias || !/^[a-f0-9]{64}$/.test(alias.moduleHash) || !Number.isSafeInteger(alias.functionIndex) || alias.functionIndex < 0 || alias.functionIndex > 250_000 || !str(alias.name, 128) || !alias.name.trim() || !data.files.some((file: any) => file.format === "wasm" && hashes.get(file.id) === alias.moduleHash) || aliasKeys.has(key)) fail("Wasm function alias");
+    aliasKeys.add(key);
+  }
+  data.wasmAliases = wasmAliases;
+  data.schema = 5;
   data.sessions ||= [];
   data.breakpoints ||= [];
   validateProjectBudgets(data as Project);
@@ -622,6 +678,8 @@ export function report(project: Project): string {
     `${escapeMarkdown(fileName(l.fileId))} · bytes ${l.start}–${l.end} (end exclusive)`;
   return [
     `# ${escapeMarkdown(project.name)}`,
+    "",
+    "Whidra · Web-based Reverse Engineering Tool",
     "",
     `Project: ${project.id}`,
     `Created: ${project.createdAt}`,
@@ -664,6 +722,13 @@ export function report(project: Project): string {
       return `- ${escapeMarkdown(step.operation)}: ${escapeMarkdown(parentName)} bytes ${step.inputRange.start}â€“${step.inputRange.end} â†’ ${escapeMarkdown(outputName)}; mapping ${step.mapping}; output SHA-256 ${step.outputHash}${step.parentUnavailable ? "; parent evidence deleted" : ""}`;
     }),
     "",
+    "## WebAssembly function aliases",
+    ...(project.wasmAliases || []).map((alias) => {
+      const module = project.files.find((f) => (f.hash || f.result?.hash) === alias.moduleHash);
+      const fn = module?.result?.wasmFunctions?.[alias.functionIndex];
+      return `- **${escapeMarkdown(alias.name)}** â†’ ${escapeMarkdown(module?.name || "unknown module")} function ${alias.functionIndex}${fn ? ` (original: ${escapeMarkdown(fn.name)})` : ""}; module SHA-256 ${alias.moduleHash}`;
+    }),
+    "",
     "## Pinned tools",
     ...project.tools.map(
       (t) => `- ${t.id}@${t.version} · SHA-256 ${t.integrity}`,
@@ -678,7 +743,7 @@ export function report(project: Project): string {
       ),
     ]),
     "",
-    "Original evidence remains in the portable WRET archive. Formatted and decoded views do not replace original bytes.",
+    "Original evidence remains in this portable Whidra archive. Formatted and decoded views do not replace original bytes.",
     "",
   ].join("\n");
 }

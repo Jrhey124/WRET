@@ -35,7 +35,10 @@ export function Graph({
               n.kind === "label" &&
               n.location.fileId === item.location.fileId &&
               n.location.start === item.location.start,
-          )?.text || item.name,
+          )?.text || project.wasmAliases?.find((alias) =>
+            alias.moduleHash === f.result?.hash &&
+            f.result?.wasmFunctions?.find((fn) => fn.index === alias.functionIndex)?.location?.start === item.location.start,
+          )?.name || item.name,
         x: kind === "function" ? 300 : 580,
         y: 55 + (kind === "function" ? functionRow++ : findingRow++) * 60,
         kind,
@@ -44,10 +47,23 @@ export function Graph({
       edges.push({ from: f.id, to: item.id, kind: "contains" });
     };
     const visibleFunctions =
-      f.result?.outline
-        .filter((x) => x.kind === "function" || x.kind === "wasm func")
-        .slice(0, 10) || [];
+      f.result?.outline.filter((x) => x.kind === "function").slice(0, 10) || [];
     visibleFunctions.forEach((x) => add(x, "function"));
+    const wasmFunctions = f.result?.wasmFunctions;
+    if (wasmFunctions) {
+      const visibleWasm = wasmFunctions.slice(0, Math.max(0, 10 - visibleFunctions.length));
+      for (const fn of visibleWasm) {
+        const id = `wasm-func:${f.id}:${fn.index}`;
+        const alias = project.wasmAliases?.find((x) => x.moduleHash === f.result?.hash && x.functionIndex === fn.index)?.name;
+        nodes.push({ id, label: alias || fn.name, kind: "function", x: 300, y: 55 + functionRow++ * 60, location: fn.location || { fileId: f.id, start: 0, end: 0 } });
+        edges.push({ from: f.id, to: id, kind: "contains" });
+      }
+      f.result?.wasmInstructions?.filter((instruction) => instruction.callTarget !== undefined).slice(0, 100).forEach((instruction) => {
+        const from = `wasm-func:${f.id}:${instruction.functionIndex}`;
+        const to = `wasm-func:${f.id}:${instruction.callTarget}`;
+        if (visibleWasm.some((x) => x.index === instruction.functionIndex) && visibleWasm.some((x) => x.index === instruction.callTarget)) edges.push({ from, to, kind: "call" });
+      });
+    }
     f.result?.findings.slice(0, 10).forEach((x) => {
       add(x, "finding");
       const owner = visibleFunctions

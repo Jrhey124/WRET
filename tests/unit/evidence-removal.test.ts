@@ -32,4 +32,14 @@ describe("remove evidence from a project", () => {
     expect(project.files).toHaveLength(2);
     expect(removeEvidence(project, "missing")).toBe(project);
   });
+  it("clears only aliases whose last matching Wasm module is deleted", () => {
+    const project = newProject(), hash = "a".repeat(64);
+    project.files = [
+      { id: "module-a", name: "a.wasm", format: "wasm", bytes: new Uint8Array([0,97,115,109]), hash },
+      { id: "module-copy", name: "copy.wasm", format: "wasm", bytes: new Uint8Array([0,97,115,109]), hash },
+    ];
+    project.wasmAliases = [{ moduleHash: hash, functionIndex: 0, name: "entry" }];
+    expect(removeEvidence(project, "module-a").wasmAliases).toHaveLength(1);
+    expect(removeEvidence({ ...project, files: [project.files[0]] }, "module-a").wasmAliases).toEqual([]);
+  });
 });

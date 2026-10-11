@@ -30,12 +30,12 @@ test("evidence tabs close independently and explorer deletion removes linked pro
   await page.getByRole("button", { name: "Close Welcome tab" }).click();
   await expect(tabs.getByRole("tab")).toHaveCount(0);
   await expect(page.getByText("No editor tab open")).toBeVisible();
-  await page.getByRole("button", { name: "Open Welcome" }).click();
+  await page.getByRole("button", { name: "Open Welcome", exact: true }).click();
   await expect(tabs.getByRole("tab", { name: "Welcome" })).toHaveAttribute("aria-selected", "true");
 
   await alphaRow.click();
   await betaRow.click();
-  await page.getByRole("button", { name: "Notes", exact: true }).click();
+  await page.getByRole("tab", { name: "Notes", exact: true }).click();
   await page.getByLabel("Analyst note").fill("Evidence attached to beta");
   await page.getByRole("button", { name: "Save note", exact: true }).click();
   await expect(page.locator(".note-card")).toContainText("Evidence attached to beta");
@@ -46,7 +46,15 @@ test("evidence tabs close independently and explorer deletion removes linked pro
   await expect(page.locator(".file-row")).toHaveCount(1);
   await expect(page.locator(".file-row")).toContainText("alpha.js");
   await expect(tabs.getByRole("tab", { name: "Inspect alpha.js" })).toHaveAttribute("aria-selected", "true");
-  await page.getByRole("button", { name: "Notes", exact: true }).click();
+  await page.waitForTimeout(4200);
+  const saveErrors = await page.locator(".alert").allTextContents();
+  expect(saveErrors, saveErrors.join("\n")).toEqual([]);
+  await page.reload();
+  await expect(page.locator(".file-row")).toHaveCount(1);
+  await expect(page.locator(".file-row")).toContainText("alpha.js");
+  const restoredTabs = page.getByRole("tablist", { name: "Open editor tabs" });
+  await expect(restoredTabs.getByRole("tab", { name: "Inspect alpha.js" })).toHaveAttribute("aria-selected", "true");
+  await page.getByRole("tab", { name: "Notes", exact: true }).click();
   await expect(page.locator(".note-card")).toHaveCount(0);
 
   const download = page.waitForEvent("download");
@@ -56,9 +64,9 @@ test("evidence tabs close independently and explorer deletion removes linked pro
   expect(archive.files.map((file: { name: string }) => file.name)).toEqual(["alpha.js"]);
   expect(archive.notes).toEqual([]);
   page.once("dialog", (message) => void message.accept());
-  await page.getByLabel("Open WRET archive").setInputFiles({ name:"cleaned.wret.json", mimeType:"application/json", buffer:archiveBytes });
+  await page.getByLabel("Open Whidra project archive").setInputFiles({ name:"cleaned.wret.json", mimeType:"application/json", buffer:archiveBytes });
   await expect(page.locator(".file-row")).toHaveCount(1);
   await expect(page.locator(".file-row")).toContainText("alpha.js");
-  await page.getByRole("button", { name:"Notes", exact:true }).click();
+  await page.getByRole("tab", { name:"Notes", exact:true }).click();
   await expect(page.locator(".note-card")).toHaveCount(0);
 });

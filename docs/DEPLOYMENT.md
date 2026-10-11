@@ -1,4 +1,4 @@
-# Docker deployment
+# Whidra Docker deployment
 
 This image provides static inspection. Dynamic debugging runs through `npm.cmd run companion` on Windows with QEMU and a prepared guest, documented in [Companion setup](COMPANION.md). The companion binds its UI and authenticated API to the same loopback origin and does not require a hosted account or database.
 
@@ -39,9 +39,9 @@ $env:WRET_DOMAIN = 'wret.example.com'
 docker compose -f compose.yaml -f compose.https.yaml up --build -d
 ```
 
-Caddy obtains and renews the TLS certificate and forwards requests to the static nginx service. Its named volumes store certificates/configuration only. WRET evidence never enters these volumes. Alternatively, place the base service behind your existing HTTPS reverse proxy, preserving security headers and serving the app at the origin root.
+Caddy obtains and renews the TLS certificate and forwards requests to the static nginx service. Its named volumes store certificates/configuration only. Whidra evidence never enters these volumes. Alternatively, place the base service behind your existing HTTPS reverse proxy, preserving security headers and serving the app at the origin root.
 
-The inherited `127.0.0.1:8080` mapping remains local to the server; HTTPS is the public entry point. Deploy behind your organization's access controls if the application itself should be restricted. WRET has no account system.
+The inherited `127.0.0.1:8080` mapping remains local to the server; HTTPS is the public entry point. Deploy behind your organization's access controls if the application itself should be restricted. Whidra has no account system. Existing `WRET_DOMAIN` deployment settings remain supported for compatibility.
 
 ## Updates and portable projects
 

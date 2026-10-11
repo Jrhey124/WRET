@@ -1,8 +1,8 @@
 import { useEffect } from "react";
 
 const help: Record<string, string> = {
-  "Open project":"Open a WRET archive and restore its evidence, findings, and notes.",
-  "Export project":"Download the current investigation as a portable WRET archive.",
+  "Open project":"Open a Whidra archive and restore its evidence, findings, and notes. Existing WRET archives are supported.",
+  "Export project":"Download the current investigation as a portable Whidra archive.",
   "Import files":"Add evidence files to this investigation.",
   "Import evidence files":"Add evidence files to this investigation.",
   "Import site folder":"Import a site folder and preserve its relative file paths.",
@@ -16,10 +16,10 @@ const help: Record<string, string> = {
   "Check companion / reconnect":"Check the companion connection and refresh its setup status.",
   "Add breakpoint":"Pause execution when guest code reaches the selected source line.",
   "Add watch":"Evaluate this watch expression in the guest while execution is paused.",
-  "Export Markdown report":"Download a readable Markdown summary of retained findings and notes.",
-  "Export portable project":"Download a WRET archive that can be reopened later.",
+  "Export Markdown report":"Download a readable Whidra Markdown summary of retained findings and notes.",
+  "Export portable project":"Download a Whidra archive that can be reopened later.",
   "Investigate a website URL":"Prepare an isolated browser session for a website. Approve its destination before allowing requests.",
-  "Open saved project":"Choose a previously exported WRET archive.",
+  "Open saved project":"Choose a previously exported Whidra or WRET archive.",
   "Project name":"Rename this investigation. The name is included in its archive and report.",
   "Project search":"Search names and text across imported evidence.",
   "Analyst note":"Write an observation attached to the selected evidence or project.",

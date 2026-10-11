@@ -1,4 +1,4 @@
-name: Validate WRET
+name: Validate Whidra
 on:
   push:
   pull_request:

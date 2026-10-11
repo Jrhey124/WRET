@@ -13,7 +13,7 @@ class ErrorBoundary extends React.Component<
   render() {
     return this.state.error ? (
       <main className="fatal">
-        <h1>WRET could not render this view</h1>
+        <h1>Whidra could not render this view</h1>
         <p>{this.state.error}</p>
         <p>
           Your last saved project remains in this browser. Reload to restore it.

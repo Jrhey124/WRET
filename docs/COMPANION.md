@@ -1,6 +1,8 @@
-# Local debugger companion
+# Whidra local debugger companion
 
 Static deployment works without a companion. Dynamic debugging uses the local Node service, QEMU, and a disposable Linux guest. The real Windows VM integration suite must pass before treating this debugger as release validated.
+
+The companion keeps its established `WRET_*` environment variables, `.wret-vm` directory, and `org.wret.control` guest channel so existing installations continue to work.
 
 ## Windows setup
 

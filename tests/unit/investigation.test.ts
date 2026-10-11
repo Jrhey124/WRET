@@ -137,7 +137,7 @@ describe("guided investigation evidence", () => {
     delete legacy.sessions;
     delete legacy.breakpoints;
     legacy.sessions = [{ bad: "must not bypass schema-2 validation" }];
-    expect((await importProject(JSON.stringify(legacy))).schema).toBe(4);
+    expect((await importProject(JSON.stringify(legacy))).schema).toBe(5);
     expect((await importProject(JSON.stringify(legacy))).sessions).toEqual([]);
     const schema2 = JSON.parse(await exportProject(p));
     schema2.schema = 2;
@@ -163,7 +163,7 @@ describe("guided investigation evidence", () => {
     }],
     }];
     const migratedSchema2 = await importProject(JSON.stringify(schema2));
-    expect(migratedSchema2.schema).toBe(4);
+    expect(migratedSchema2.schema).toBe(5);
     expect(migratedSchema2.notes[0].text).toBe("Keep this note");
     expect(migratedSchema2.breakpoints).toHaveLength(1);
     expect(migratedSchema2.sessions?.[0].requests?.[0].url).toContain("old.js");

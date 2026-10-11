@@ -34,6 +34,10 @@ network_contexts = {}
 pause_exceptions = 'none'
 skip_pauses = False
 live_edit_supported = False
+monitor_wasm_bridge = False
+capture_wasm_modules = False
+bridge_decoders = []
+bridge_targets = {}
 cdp = None
 main_session = None
 root_prefix = ''
@@ -88,6 +92,48 @@ def call(method, params=None, session=None):
         with pending_lock:
             pending_cdp.pop(ident, None)
 
+BRIDGE_INSTALL = r'''(() => {
+  if (globalThis.__whidraWasmBridgeInstalled || typeof globalThis.__whidraBridgeEvent !== 'function') return;
+  Object.defineProperty(globalThis, '__whidraWasmBridgeInstalled', {value:true});
+  let nextModule=1, nextCall=1, emitted=0, capped=false;
+  const stack=[];
+  const moduleIds=new WeakMap(), wrapped=new WeakMap(), memories=new Map(), exportObjects=new WeakMap();
+  const decoders=__WHIDRA_WASM_DECODERS__;
+  const safe=(value)=>{ try { if(value===null||['string','number','boolean','undefined'].includes(typeof value)) return typeof value==='string'?value.slice(0,512):value; if(typeof value==='bigint')return value.toString()+'n'; if(typeof value==='function')return `[Function ${value.name||'anonymous'}]`; if(value instanceof WebAssembly.Memory)return `[Memory ${value.buffer.byteLength} bytes]`; if(ArrayBuffer.isView(value))return `[${value.constructor.name} ${value.byteLength} bytes]`; return `[${value?.constructor?.name||typeof value}]`; }catch(_){return '[unavailable]';} };
+  const emit=(event)=>{try{if(emitted>=10000){if(!capped){capped=true;globalThis.__whidraBridgeEvent(JSON.stringify({time:performance.now(),phase:'truncated',detail:'Local bridge event limit reached; further events omitted.'}));}return;}emitted++;globalThis.__whidraBridgeEvent(JSON.stringify({time:performance.now(),...event}));}catch(_){}};
+  const registerMemory=(id,name,memory)=>{if(!(memory instanceof WebAssembly.Memory))return;let values=memories.get(id);if(!values){values=new Map();memories.set(id,values);}if(!values.has(name)){values.set(name,memory);let shared=false;try{shared=typeof SharedArrayBuffer!=='undefined'&&memory.buffer instanceof SharedArrayBuffer;}catch(_){}emit({phase:'memoryAvailable',moduleId:id,memoryName:name,byteLength:memory.buffer.byteLength,shared});}};
+  const decodeArguments=(args,id,direction,functionName)=>decoders.filter(rule=>rule.direction===direction&&rule.functionName===functionName).map(rule=>{try{const memory=memories.get(id)?.get(rule.memoryName);if(!memory)return {memoryName:rule.memoryName,error:'Selected memory is not available for this instance.'};const pointer=args[rule.pointerArgument];if(typeof pointer!=='number'||!Number.isSafeInteger(pointer)||pointer<0)return {memoryName:rule.memoryName,error:'Pointer argument is not a non-negative safe integer.'};const buffer=memory.buffer;if(pointer>=buffer.byteLength)return {memoryName:rule.memoryName,error:'Pointer is outside the current memory buffer.'};let length=rule.lengthArgument===undefined?4096:args[rule.lengthArgument];if(rule.lengthArgument!==undefined&&(!Number.isSafeInteger(length)||length<0))return {memoryName:rule.memoryName,error:'Length argument is not a non-negative safe integer.'};const requested=rule.lengthArgument===undefined?4096:length,available=Math.min(4096,buffer.byteLength-pointer),count=Math.min(requested,available);const bytes=new Uint8Array(buffer,pointer,count);let used=count,terminated=false;if(rule.lengthArgument===undefined){const nul=bytes.indexOf(0);if(nul>=0){used=nul;terminated=true;}}return {memoryName:rule.memoryName,text:new TextDecoder('utf-8',{fatal:false}).decode(bytes.subarray(0,used)),bytes:used,truncated:requested>count||(rule.lengthArgument===undefined&&!terminated),shared:typeof SharedArrayBuffer!=='undefined'&&buffer instanceof SharedArrayBuffer};}catch(error){return {memoryName:rule.memoryName,error:String(error).slice(0,500)};}});
+  const wrap=(fn,direction,moduleId,name)=>{if(wrapped.has(fn))return wrapped.get(fn);const wrappedFn=function(...args){const callId=nextCall++,parent=stack.at(-1);stack.push(callId);emit({phase:'enter',callId,parent,direction,moduleId,function:name,args:args.slice(0,16).map(safe),decodedArguments:decodeArguments(args,moduleId,direction,name),source:String(new Error().stack||'').slice(0,2048)});try{const value=Reflect.apply(fn,this,args);emit({phase:'return',callId,direction,moduleId,function:name,value:safe(value)});return value;}catch(error){emit({phase:'trap',callId,direction,moduleId,function:name,error:safe(String(error))});throw error;}finally{stack.pop();}};try{Object.defineProperty(wrappedFn,'name',{value:fn.name,configurable:true});}catch(_){}wrapped.set(fn,wrappedFn);return wrappedFn;};
+  const imports=(value,id)=>{if(!value||typeof value!=='object')return value;const copy=Object.create(null);for(const ns of Reflect.ownKeys(value)){const source=value[ns],target=Object.create(null);if(source&&typeof source==='object')for(const key of Reflect.ownKeys(source)){const desc=Object.getOwnPropertyDescriptor(source,key);if(desc&&'value'in desc&&desc.value instanceof WebAssembly.Memory)registerMemory(id,`${String(ns)}.${String(key)}`,desc.value);if(desc&&'value'in desc&&typeof desc.value==='function')desc.value=wrap(desc.value,'wasm-to-js',id,`${String(ns)}.${String(key)}`);if(desc)Object.defineProperty(target,key,desc);}copy[ns]=target;}return copy;};
+  const exports=(instance,id)=>{if(exportObjects.has(instance))return exportObjects.get(instance);const original=instance.exports,copy=Object.create(null);for(const key of Reflect.ownKeys(original)){const value=Reflect.get(original,key,original);if(value instanceof WebAssembly.Memory)registerMemory(id,`exports.${String(key)}`,value);Object.defineProperty(copy,key,{value:typeof value==='function'?wrap(value,'js-to-wasm',id,String(key)):value,enumerable:true,writable:false,configurable:false});}exportObjects.set(instance,copy);return copy;};
+  const facade=(instance,id)=>new Proxy(instance,{get(target,key){if(key==='exports')return exports(target,id);return Reflect.get(target,key,target);}});
+  const moduleId=(module)=>{if(module&&typeof module==='object'){if(!moduleIds.has(module))moduleIds.set(module,`wasm-${nextModule++}`);return moduleIds.get(module);}return `wasm-${nextModule++}`;};
+  const originalInstantiate=WebAssembly.instantiate.bind(WebAssembly);
+  WebAssembly.instantiate=function(source,importsObject){const id=moduleId(source);return originalInstantiate(source,imports(importsObject,id)).then(result=>result&&result.instance?{...result,instance:facade(result.instance,id)}:facade(result,id));};
+  if(typeof WebAssembly.instantiateStreaming==='function'){const original=WebAssembly.instantiateStreaming.bind(WebAssembly);WebAssembly.instantiateStreaming=function(response,importsObject){const id=`wasm-${nextModule++}`;return original(response,imports(importsObject,id)).then(result=>result&&result.instance?{...result,instance:facade(result.instance,id)}:facade(result,id));};}
+  try{const Original=WebAssembly.Instance;function InstrumentedInstance(module,importsObject){const id=moduleId(module);const instance=Reflect.construct(Original,[module,imports(importsObject,id)],new.target===InstrumentedInstance?Original:new.target);return facade(instance,id);}InstrumentedInstance.prototype=Original.prototype;Object.setPrototypeOf(InstrumentedInstance,Original);WebAssembly.Instance=InstrumentedInstance;}catch(_){emit({phase:'coverage',detail:'WebAssembly.Instance constructor could not be wrapped'});}
+  emit({phase:'coverage',detail:'Wrapped instantiate, instantiateStreaming, and Instance constructor. Direct instance access and Wasm-internal calls are not observed; instrumentation can affect identity and timing.'});
+})();'''
+
+def install_bridge(session, info):
+    if not monitor_wasm_bridge:
+        return False
+    try:
+        call('Runtime.addBinding', {'name': '__whidraBridgeEvent'}, session)
+        kind = info.get('type', 'page')
+        source = BRIDGE_INSTALL.replace('__WHIDRA_WASM_DECODERS__', json.dumps(bridge_decoders, separators=(',', ':')))
+        if kind in ['page', 'iframe']:
+            call('Page.addScriptToEvaluateOnNewDocument', {'source': source}, session)
+        result = call('Runtime.evaluate', {'expression': source, 'awaitPromise': False}, session)
+        if result.get('exceptionDetails'):
+            raise RuntimeError('Instrumentation initialization script failed: ' + str(result['exceptionDetails'])[:1000])
+        bridge_targets[session] = True
+        return True
+    except Exception as error:
+        bridge_targets[session] = False
+        observe('diagnostic', 'Wasm bridge monitor unavailable for ' + info.get('type', 'target') + ': ' + str(error))
+        return False
+
 def initialize(session, info):
     targets[session] = info
     for method in ['Runtime.enable', 'Debugger.enable', 'Network.enable']:
@@ -103,9 +149,12 @@ def initialize(session, info):
         set_breakpoint(session, bp['definition'])
     if info.get('type') in ['page', 'iframe']:
         call('Page.enable', session=session)
+        install_bridge(session, info)
         if info.get('type') == 'page':
             call('Emulation.setDeviceMetricsOverride', {'width': 1280, 'height': 720, 'deviceScaleFactor': 1, 'mobile': False}, session)
             call('Page.startScreencast', {'format': 'jpeg', 'quality': 60, 'maxWidth': 1280, 'maxHeight': 720, 'everyNthFrame': 2}, session)
+    else:
+        install_bridge(session, info)
     call('Runtime.runIfWaitingForDebugger', session=session)
     targets[session]['initialized'] = True
 
@@ -146,6 +195,24 @@ def handle_event(message):
             if data.get('url') == 'wret://capability-probe':
                 return
             script_urls[(session, data['scriptId'])] = data.get('url', '')
+            if str(data.get('scriptLanguage', '')).lower() == 'webassembly':
+                wasm_info = {'scriptId': data.get('scriptId'), 'url': data.get('url', ''), 'targetType': targets.get(session, {}).get('type', 'page'), 'codeOffset': data.get('codeOffset'), 'target': session}
+                if capture_wasm_modules:
+                    try:
+                        source = call('Debugger.getScriptSource', {'scriptId': data['scriptId']}, session)
+                        encoded = source.get('bytecode', '')
+                        raw = base64.b64decode(encoded, validate=True) if encoded else b''
+                        if not raw or raw[:4] != b'\x00asm':
+                            observe('wasmModule', {**wasm_info, 'truncated': True, 'reason': 'Chromium did not return complete Wasm bytecode.'})
+                        elif len(raw) > 25 * 1024 * 1024:
+                            observe('wasmModule', {**wasm_info, 'byteLength': len(raw), 'truncated': True, 'reason': 'Module exceeds the 25 MiB evidence limit.'})
+                        else:
+                            observe('wasmModule', {**wasm_info, 'body': base64.b64encode(raw).decode('ascii'), 'byteLength': len(raw), 'truncated': False})
+                    except Exception as error:
+                        observe('wasmModule', {**wasm_info, 'truncated': True, 'reason': 'Chromium Wasm bytecode capture failed: ' + str(error)[:1000]})
+                else:
+                    observe('wasmScript', wasm_info)
+                return
             if data.get('length', 0) > 1024 * 1024:
                 observe('diagnostic', 'Script capture exceeds 1 MiB: ' + data.get('url', ''))
                 return
@@ -158,6 +225,13 @@ def handle_event(message):
             observe('paused', {'target': session, **data})
         elif method == 'Debugger.resumed':
             observe('running', {'target': session})
+        elif method == 'Runtime.bindingCalled' and data.get('name') == '__whidraBridgeEvent':
+            try:
+                payload = json.loads(data.get('payload', ''))
+                if isinstance(payload, dict) and len(json.dumps(payload)) <= 16 * 1024:
+                    observe('wasmBridge', {'target': session, **payload})
+            except Exception:
+                observe('diagnostic', 'Dropped malformed WebAssembly bridge event')
         elif method in ['Runtime.consoleAPICalled', 'Runtime.exceptionThrown']:
             observe('console' if method.endswith('consoleAPICalled') else 'exception', {'target': session, **data})
         elif method.startswith('Network.webSocket'):
@@ -234,8 +308,12 @@ class EvidenceServer(http.server.BaseHTTPRequestHandler):
         pass
 
 def start(input):
-    global cdp, main_session, root_prefix, pause_exceptions, live_edit_supported
+    global cdp, main_session, root_prefix, pause_exceptions, live_edit_supported, monitor_wasm_bridge, capture_wasm_modules, bridge_decoders
     pause_exceptions = input.get('exceptionState', 'none')
+    monitor_wasm_bridge = input.get('monitorWasmBridge', False) is True
+    capture_wasm_modules = input.get('captureWasmModules', False) is True
+    bridge_decoders = input.get('wasmStringDecoders', []) if isinstance(input.get('wasmStringDecoders', []), list) else []
+    bridge_targets.clear()
     files.update({f['name']: base64.b64decode(f['bytes'], validate=True) for f in input['files']})
     if files:
         entry = input.get('entry', '')
@@ -279,6 +357,13 @@ def start(input):
         url = input['target']
     features = ['snapshot', 'pausePolicy']
     unsupported = {}
+    if monitor_wasm_bridge:
+        if bridge_targets.get(main_session):
+            features.append('wasmBridge')
+        else:
+            unsupported['wasmBridge'] = 'WebAssembly bridge instrumentation could not be installed on the main target; review diagnostics and Chromium capability support.'
+    else:
+        unsupported['wasmBridge'] = 'Optional WebAssembly bridge monitoring was not enabled for this session.'
     live_edit_supported = False
     try:
         probe = call('Runtime.compileScript', {'expression': 'void 0', 'sourceURL': 'wret://capability-probe', 'persistScript': True}, main_session)

@@ -9,7 +9,7 @@ test("guided workflow preserves folder paths, links dependencies and maps, and r
   await page.goto("/");
   await expect(
     page.getByRole("heading", {
-      name: "WRET: Web-based Reverse Engineering Tool",
+      name: "Whidra — Web-based Reverse Engineering Tool",
     }),
   ).toBeVisible();
   const inspectTab = page.getByRole("button", { name: "Inspect", exact: true });

@@ -137,6 +137,13 @@ describe("static investigation", () => {
     });
     expect(r.diagnostics).toEqual([]);
     expect(r.wat).toContain("i32.const 42");
+    expect(r.wasmFunctions?.map((f) => [f.index, f.imported])).toEqual([[0, true], [1, false]]);
+    expect(r.wasmFunctions?.[0].name).toBe("$env.log");
+    expect(r.wasmFunctions?.[1].name).toBe("$answer");
+    expect(r.wasmInstructions?.some((i) => i.functionIndex === 1 && i.opcode === "i32.const" && i.operands === "42")).toBe(true);
+    const constant = r.wasmInstructions?.find((i) => i.opcode === "i32.const")!;
+    expect(bytes[constant.offset]).toBe(0x41);
+    expect(bytes[constant.end - 1]).toBe(42);
     expect(r.outline.map((x) => x.kind)).toContain("wasm import");
     expect(r.outline.map((x) => x.kind)).toContain("wasm export");
     const fn = r.outline.find((x) => x.kind === "wasm func")!;

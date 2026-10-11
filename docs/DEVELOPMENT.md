@@ -1,6 +1,8 @@
-# Development and verification
+# Whidra development and verification
 
-WRET's inspection frontend is React/TypeScript. Static Docker hosting has no backend API. The optional local Node companion adds authenticated debugger control and a disposable QEMU guest; see [Companion setup](COMPANION.md). Project evidence, notes, results, transformations, pinned tools, and sanitized runtime records remain in browser IndexedDB. Selected evidence is copied into the local guest only when a user starts a dynamic session.
+Whidra's inspection frontend is React/TypeScript. Static Docker hosting has no backend API. The optional local Node companion adds authenticated debugger control and a disposable QEMU guest; see [Companion setup](COMPANION.md). Project evidence, notes, results, transformations, pinned tools, and sanitized runtime records remain in browser IndexedDB. Selected evidence is copied into the local guest only when a user starts a dynamic session.
+
+The `wret` IndexedDB name and `WRET_*` identifiers are retained for compatibility with existing Whidra installations.
 
 ## Local development
 
@@ -53,7 +55,7 @@ Set `WRET_BASE_URL=http://127.0.0.1:8080` to run the same tests against an alrea
 - Worker input: `{ file: { id, name, bytes, format }, options?: { maxEntries } }`. Entry limits can be lowered, but not raised beyond the release maximum. Worker messages are `{ type: 'progress', progress }`, `{ type: 'result', result }`, or `{ type: 'error', error }`.
 - JS references use lexical scope analysis. Only unmodified lexical function bindings are statically resolved. Property calls, dynamic targets, and unknown bindings remain explicitly unresolved. These are syntactic/lexical relationships, not claims about all runtime behavior.
 - AST inspection is a bounded indented syntax-tree index with clickable original ranges. Formatted source has no exact source map: annotation uses the original view.
-- WASM function-body ranges map to original code bytes; imports/exports map to their containing section. WAT line targets allow navigation without claiming instruction-level mappings. WABT itself uses trusted tool code; imported modules are read as data, never instantiated.
+- WASM function-body ranges map to original code bytes; imports/exports map to their containing section. A bounded WebAssembly 1.0 instruction reader records original byte ranges, direct calls, and partial-coverage diagnostics; proposal opcodes it cannot safely size remain unindexed. Analyst aliases are separate from original names and bytes and are keyed by module hash/function index. WABT itself uses trusted tool code; imported modules are read as data, never instantiated during static analysis.
 - Source maps are inspected as JSON and their declared sources are listed. No referenced source is downloaded and mappings are not automatically applied. HTML and CSS are source/hex plus indicators and strings.
 - Tool bundles are self-contained and served from `/tools/`. A pinned tool must match the current server's first-party manifest before any executable bundle is downloaded. The digest is verified before worker creation. A mismatched historical pin preserves existing results and refuses reanalysis; use the matching release image or begin a new project.
 - The manifest is a same-origin trust root, not a publisher signature. Host the app and tools on infrastructure you trust.
@@ -68,9 +70,9 @@ Decode input is at most 1 MiB, with 1,000 stored transformations and 50,000 note
 
 ## Validation coverage
 
-Unit tests cover normal/minified/obfuscated/malformed JavaScript, lexical shadowing and reassignment, Unicode/BOM/newline coordinates, static indicators, missing maps, inert HTML, binary metadata, stripped/truncated WASM, schema 1/2/3 archive migration, network event normalization, HAR body limits and credential redaction, tampering and invalid archive ranges, atomic storage, Markdown escaping, decoding errors, worker crashes, pin mismatch, cancellation and termination.
+Unit tests cover normal/minified/obfuscated/malformed JavaScript, lexical shadowing and reassignment, Unicode/BOM/newline coordinates, static indicators, missing maps, inert HTML, binary metadata, stripped/truncated WASM and instruction offsets, schema 1–5 archive migration, aliases, network event normalization, HAR body limits and credential redaction, tampering and invalid archive ranges, atomic storage, Markdown escaping, decoding errors, worker crashes, pin mismatch, cancellation and termination.
 
-Browser tests exercise the production bundle and CSP: import → evidence navigation → status → notes/labels → formatting → graph → decoding → search → reports → archive export/import → reload. They also cover inert HTML, WASM navigation, oversized inputs, tool integrity failure, cancellation, quota exhaustion, offline HAR import and linked response evidence, and a network log asserting only first-party GET requests with no sample/notes payloads.
+Browser tests exercise the production bundle and CSP: import → evidence navigation → status → notes/labels → formatting → graph → decoding → search → reports → archive export/import → reload. They also cover inert HTML, WASM instruction/alias navigation, oversized inputs, tool integrity failure, cancellation, quota exhaustion, offline HAR import and linked response evidence, and a network log asserting only first-party GET requests with no sample/notes payloads.
 
 CI additionally builds and runs the Docker image, checks health, validates nginx configuration, checks CSP headers and rejects POST. Local Docker validation requires an installed Docker engine.
 
@@ -80,7 +82,7 @@ The guarantees in this section apply to static inspection. Starting a companion 
 
 No sample execution, uploads, sample-driven fetches, third-party analytics, CDN scripts, accounts or cloud analysis. Monaco link activation is disabled. Workers provide responsiveness and cancellation, not a sandbox for running malware. The production CSP allows first-party application scripts and trusted tool WebAssembly compilation, blob workers, and inline styles required by Monaco; it prohibits frames and object embeds. Downloads of projects/reports are user actions within the browser.
 
-The guided workflow now adds local source-map navigation, embedded map originals, inert HTML resource relationships, bounded string folding and nested decoding, offline HAR import, structured network request capture, response evidence links, and a VM debugger implementation. Page element tracing, sample comparison, storage inspection, advanced WASM runtime debugging/decompilation, and external WebSocket transport remain future work. Windows VM lifecycle acceptance is required separately from the network-disabled Chromium container protocol tests.
+The guided workflow now adds local source-map navigation, embedded map originals, inert HTML resource relationships, bounded string folding and nested decoding, offline HAR import, structured network request capture, response evidence links, and a VM debugger implementation. WebAssembly additions include explicit module capture through Chromium’s Wasm script-source capability and an opt-in JavaScript/Wasm boundary wrapper. The monitor can affect timing and function identity; direct instance access, Wasm-internal calls, pointer decoding, and complete target coverage are not promised. Runtime linear-memory snapshots, CFG simplification, and collaboration relay remain future releases. Windows VM lifecycle and bridge instrumentation acceptance require the real Windows/QEMU suite; network-disabled Chromium tests alone do not establish VM isolation.
 
 ## Companion interfaces and persistence
 

@@ -49,7 +49,7 @@ test("searches binary bytes and preserves exact selections across UTF-8 BOM and 
   await page.getByRole("tab", { name: "Decode", exact: true }).click();
   await page.getByRole("button", { name: "Use evidence selection" }).click();
   await expect(page.getByLabel("Encoded input")).toHaveValue("fetch");
-  await page.getByRole("button", { name: "Search", exact: true }).click();
+  await page.getByRole("tab", { name: "Search", exact: true }).click();
   await page.getByLabel("Project search").fill("beacon");
   await expect(page.locator(".inspector .evidence-row")).toHaveCount(1);
   await page.locator(".inspector .evidence-row button").click();
@@ -83,7 +83,7 @@ test("a failed restore cannot overwrite the last saved project", async ({
     await page.evaluate(
       () =>
         new Promise((resolve) => {
-          const request = indexedDB.open("wret", 1);
+          const request = indexedDB.open("wret");
           request.onsuccess = () => {
             const db = request.result;
             const cursor = db

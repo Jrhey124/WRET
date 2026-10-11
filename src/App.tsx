@@ -19,7 +19,7 @@ import {
   saveProject,
   validateProjectBudgets,
 } from "./storage";
-import { loadTool, runAnalysis, WORKER_TIMEOUT } from "./runtime";
+import { loadTool, runAnalysis, verifyToolBundle, WORKER_TIMEOUT, PinnedToolUnavailableError } from "./runtime";
 import {
   decodeText,
   detectFormat,
@@ -42,7 +42,9 @@ import { NetworkView } from "./NetworkView";
 import { ResearchView } from "./ResearchView";
 import { StaticRenderView } from "./StaticRenderView";
 import { buildStaticPreview } from "./static-render";
-import wretLogoUrl from "./assets/wret-logo.png";
+import whidraLogoUrl from "./assets/whidra-hydra-gear.png";
+import packageJson from "../package.json";
+import { WasmView } from "./WasmView";
 import BeautifyWorker from "./analysis.worker?worker";
 import { parseHar } from "./har";
 import {
@@ -66,7 +68,7 @@ function Editor(props: ComponentProps<typeof LazyEditor>) {
 }
 
 type View =
-  "Original" | "Hex" | "Beautified" | "AST" | "WAT" | "Graph" | "Decode" | "Render";
+  "Original" | "Hex" | "Beautified" | "AST" | "WAT" | "Wasm" | "Graph" | "Decode" | "Render";
 type Panel =
   "Findings" | "Symbols" | "Search" | "Notes" | "Strings" | "Sections";
 const WELCOME_TAB_ID = "__wret_welcome__";
@@ -129,11 +131,15 @@ export function App() {
   const [fileMenu, setFileMenu] = useState<{ id: string; x: number; y: number }>();
   const [view, setView] = useState<View>("Original"),
     [panel, setPanel] = useState<Panel>("Findings");
+  const inspectorTabRefs = useRef<Partial<Record<Panel, HTMLButtonElement | null>>>({});
   const [location, setLocation] = useState<Location>(),
     [watLine, setWatLine] = useState<number>();
   const [jobs, setJobs] = useState<Job[]>([]),
     [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  const [toolStatus, setToolStatus] = useState<"checking" | "ready" | "update" | "unavailable">("checking");
+  const [toolRecovery, setToolRecovery] = useState<{ installed: import("./model").ToolPin; fileIds: string[] }>();
+  const [toolStatusMessage, setToolStatusMessage] = useState("");
   const [beautified, setBeautified] = useState<Record<string, string>>({});
   const [beautifying, setBeautifying] = useState(false);
   const beautifyWorker = useRef<Worker | undefined>(undefined);
@@ -143,6 +149,24 @@ export function App() {
   const [storageError, setStorageError] = useState(""),
     [persistent, setPersistent] = useState(false);
   const [restoreFailed, setRestoreFailed] = useState(false);
+  useEffect(() => {
+    if (!ready) return;
+    let active = true;
+    setToolStatus("checking");
+    loadTool().then(async (installed) => {
+      await verifyToolBundle(installed);
+      if (!active) return;
+      const pins = project.tools.filter((pin) => pin.id === installed.id);
+      const currentPin = pins[pins.length - 1];
+      setToolStatus(currentPin && (currentPin.version !== installed.version || currentPin.integrity !== installed.integrity || currentPin.entry !== installed.entry) ? "update" : "ready");
+      setToolStatusMessage("");
+    }).catch((cause) => {
+      if (!active) return;
+      setToolStatus("unavailable");
+      setToolStatusMessage(String(cause));
+    });
+    return () => { active = false; };
+  }, [ready, project.id, project.tools.map((pin) => `${pin.id}:${pin.version}:${pin.integrity}`).join("|")]);
   const [query, setQuery] = useState(""),
     [matches, setMatches] = useState<Item[]>([]),
     [searching, setSearching] = useState(false);
@@ -162,9 +186,21 @@ export function App() {
   const lock = useRef(false),
     writeQueue = useRef(Promise.resolve()),
     revision = useRef(0),
-    savedRevision = useRef(0);
+    savedRevision = useRef(0),
+    checkpointPending = useRef(false),
+    pendingWrites = useRef(0);
   const file = project.files.find((f) => f.id === selected);
   const result = file?.result;
+  let displayedWat = result?.wat;
+  if (displayedWat && result?.wasmFunctions) {
+    for (const fn of result.wasmFunctions) {
+      const alias = (project.wasmAliases || []).find((x) => x.moduleHash === result.hash && x.functionIndex === fn.index)?.name;
+      if (alias && /^[A-Za-z_$][\w$.-]{0,127}$/.test(alias) && fn.name.startsWith("$")) {
+        const escaped = fn.name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+        displayedWat = displayedWat.replace(new RegExp(`${escaped}(?=[\\s)]|$)`, "g"), `$${alias}`);
+      }
+    }
+  }
   const resources = useMemo(() => dependencies(project.files), [project.files]);
   const mapping = useMemo(
     () =>
@@ -275,8 +311,10 @@ export function App() {
     if (!ready || restoreFailed) return;
     const rev = ++revision.current;
     const timer = setTimeout(() => {
+      const snapshot = project;
+      pendingWrites.current++;
       writeQueue.current = writeQueue.current
-        .then(() => saveProject(project))
+        .then(() => saveProject(snapshot))
         .then(() => {
           savedRevision.current = rev;
           if (revision.current === rev) {
@@ -284,27 +322,36 @@ export function App() {
           }
         })
         .catch((e) => {
-          setStorageError(
+          if (revision.current === rev) setStorageError(
             `Browser storage failed: ${String(e)}. Your current work is still in memory. Export your project now, then free browser storage and retry.`,
           );
-        });
+        })
+        .finally(() => { pendingWrites.current = Math.max(0, pendingWrites.current - 1); });
     }, 350);
     return () => clearTimeout(timer);
   }, [project, ready, restoreFailed]);
   useEffect(() => {
     const checkpoint = setInterval(() => {
-      if (!ready || restoreFailed || revision.current === savedRevision.current)
+      if (!ready || restoreFailed || checkpointPending.current || pendingWrites.current > 0 || revision.current === savedRevision.current)
         return;
       const revisionAtSave = revision.current;
+      const snapshot = current.current;
+      checkpointPending.current = true;
+      pendingWrites.current++;
       writeQueue.current = writeQueue.current
-        .then(() => saveProject(current.current))
+        .then(() => saveProject(snapshot))
         .then(() => {
           savedRevision.current = revisionAtSave;
+          if (revision.current === revisionAtSave) setStorageError("");
         })
         .catch((e) => {
-          setStorageError(
+          if (revision.current === revisionAtSave) setStorageError(
             `Checkpoint failed: ${String(e)}. Export your project to preserve captured evidence.`,
           );
+        })
+        .finally(() => {
+          checkpointPending.current = false;
+          pendingWrites.current = Math.max(0, pendingWrites.current - 1);
         });
     }, 3000);
     return () => clearInterval(checkpoint);
@@ -499,7 +546,7 @@ export function App() {
     if (!canDeleteEvidence) return;
     const linkedNotes = project.notes.filter((note) => note.location.fileId === evidence.id).length;
     const linkedDecodes = project.decodes.filter((decode) => decode.location.fileId === evidence.id).length;
-    if (!window.confirm(`Remove “${evidence.name}” from this WRET project? This also removes ${linkedNotes} linked note(s), ${linkedDecodes} decoding record(s), its analysis results, and its breakpoints. The original file on your device is not deleted.`)) return;
+    if (!window.confirm(`Remove “${evidence.name}” from this Whidra project? This also removes ${linkedNotes} linked note(s), ${linkedDecodes} decoding record(s), its analysis results, and its breakpoints. The original file on your device is not deleted.`)) return;
     const index = openTabs.indexOf(evidence.id);
     const nextTabs = openTabs.filter((id) => id !== evidence.id);
     const removingActive = selected === evidence.id;
@@ -529,6 +576,28 @@ export function App() {
       progress: "Waiting",
     }));
     setJobs((previous) => [...batch, ...previous].slice(0, 1000));
+    let installed: import("./model").ToolPin;
+    try { installed = await loadTool(); }
+    catch (cause) {
+      setToolStatus("unavailable");
+      setToolStatusMessage(String(cause));
+      for (const job of batch) patchJob(job.id, { status: "failed", progress: String(cause) });
+      setError(String(cause));
+      return;
+    }
+    setToolStatus("ready");
+    const pins = current.current.tools.filter((pin) => pin.id === installed.id);
+    const pin = pins[pins.length - 1];
+    if (pin && (pin.version !== installed.version || pin.integrity !== installed.integrity || pin.entry !== installed.entry)) {
+      setToolStatus("update");
+      setToolRecovery({ installed, fileIds: files.map((item) => item.id) });
+      setError("");
+      for (const job of batch) patchJob(job.id, { status: "failed", progress: "Analyzer update required; existing results are retained" });
+      return;
+    }
+    setToolRecovery(undefined);
+    const activePin = pin ?? installed;
+    if (!pin) update((p) => ({ ...p, tools: [...p.tools, installed] }));
     for (let i = 0; i < files.length; i++) {
       const job = batch[i];
       if (cancelled.current) {
@@ -545,17 +614,13 @@ export function App() {
         progress: "Checking first-party tool integrity",
       });
       try {
-        let tool = current.current.tools.find((t) => t.id === "wret-static");
-        if (!tool) {
-          tool = await loadTool(controller.signal);
-          const pinned = tool;
-          update((p) => ({ ...p, tools: [...p.tools, pinned] }));
-        }
         const output = await runAnalysis(
           files[i],
-          tool,
+          activePin,
           (progress) => patchJob(job.id, { progress }),
           controller.signal,
+          WORKER_TIMEOUT,
+          installed,
         );
         const analyzed = {
           ...current.current,
@@ -572,6 +637,12 @@ export function App() {
             : "Complete",
         });
       } catch (e) {
+        if (e instanceof PinnedToolUnavailableError) {
+          setToolStatus("update");
+          setToolRecovery({ installed: e.installed, fileIds: files.slice(i).map((item) => item.id) });
+          patchJob(job.id, { status: "failed", progress: e.message });
+          return;
+        }
         const wasCancelled = controller.signal.aborted;
         patchJob(job.id, {
           status: wasCancelled ? "cancelled" : "failed",
@@ -581,6 +652,29 @@ export function App() {
       } finally {
         abort.current = null;
       }
+    }
+  }
+  async function useInstalledAnalyzer() {
+    const pending = toolRecovery;
+    if (!pending || busy) return;
+    setBusy(true);
+    try {
+      const installed = await loadTool();
+      await verifyToolBundle(installed);
+      const validIds = new Set(pending.fileIds);
+      const retryFiles = current.current.files.filter((item) => validIds.has(item.id));
+      if (!retryFiles.length) { setToolRecovery(undefined); return; }
+      update((p) => ({ ...p, tools: [...p.tools, installed] }));
+      setToolRecovery(undefined);
+      setToolStatus("ready");
+      setError("");
+      await analyze(retryFiles);
+    } catch (cause) {
+      setToolStatus("unavailable");
+      setToolStatusMessage(String(cause));
+      setError(String(cause));
+    } finally {
+      setBusy(false);
     }
   }
   async function importFiles(list: FileList | File[]) {
@@ -748,7 +842,7 @@ export function App() {
       if (sessionBytes > 50 * 1024 * 1024) throw new Error("HAR records exceed the 50 MiB session capture limit.");
       const next: Project = {
         ...current.current,
-        schema: 4,
+        schema: 5,
         files: [...current.current.files, ...capturedFiles],
         sessions: [...(current.current.sessions || []), {
           id,
@@ -775,7 +869,7 @@ export function App() {
   async function exportArchive() {
     try {
       download(
-        `${project.name.replace(/[^a-zA-Z0-9_-]/g, "_")}.wret.json`,
+        `${project.name.replace(/[^a-zA-Z0-9_-]/g, "_")}.whidra.json`,
         await exportProject(current.current),
         "application/json",
       );
@@ -889,8 +983,10 @@ export function App() {
         <div className="result-count">
           {filtered.length.toLocaleString()} entries
         </div>
-        {filtered.slice(0, resultCount).map((item) => (
-          <div className="evidence-row" key={item.id}>
+        {filtered.slice(0, resultCount).map((item) => {
+          const wasmFunction = item.kind === "wasm func" ? result?.wasmFunctions?.find((fn) => fn.location?.start === item.location.start) : undefined;
+          const wasmAlias = wasmFunction && result?.hash ? project.wasmAliases?.find((alias) => alias.moduleHash === result.hash && alias.functionIndex === wasmFunction.index)?.name : undefined;
+          return <div className="evidence-row" key={item.id}>
             <button
               className="evidence-link"
               onClick={() => navigate(item.location, item)}
@@ -903,7 +999,7 @@ export function App() {
                     n.kind === "label" &&
                     n.location.fileId === item.location.fileId &&
                     n.location.start === item.location.start,
-                )?.text || item.name}
+                )?.text || (wasmAlias ? `${wasmAlias} (original ${wasmFunction?.name})` : item.name)}
               </span>
               <small>
                 {item.detail ||
@@ -923,8 +1019,8 @@ export function App() {
                 Go to function ↗
               </button>
             )}
-          </div>
-        ))}
+          </div>;
+        })}
         {filtered.length > resultCount && (
           <button
             className="more"
@@ -934,11 +1030,26 @@ export function App() {
           </button>
         )}
         {!filtered.length && (
-          <p className="empty-small">No entries in this view.</p>
+          <p className="inspector-empty" role="status">
+            {filter ? "No results match this filter." : !file ? "Select evidence in Project Explorer to see its analysis here." : result ? "No entries are available in this view." : "Analysis has not completed for this evidence yet."}
+          </p>
         )}
       </>
     );
   };
+
+  const inspectorPanels: Panel[] = ["Findings", "Symbols", "Search", "Notes", "Strings", "Sections"];
+  const inspectorCount = (name: Panel) => {
+    if (name === "Findings") return result?.findings.length;
+    if (name === "Symbols") return result ? result.outline.length + result.calls.length + result.references.length : undefined;
+    if (name === "Search") return matches.length;
+    if (name === "Notes") return project.notes.length;
+    if (name === "Strings") return result?.strings.length;
+    return result?.sections.length;
+  };
+  const filteredFindings = (result?.findings || []).filter((finding) =>
+    `${finding.name} ${finding.kind}`.toLowerCase().includes(filter.toLowerCase()),
+  );
 
   const commands: PaletteCommand[] = [
     ...(["Overview", "Inspect", "Network", "Research", "Debug", "Report"] as const).map((section) => ({
@@ -956,11 +1067,12 @@ export function App() {
       run: () => setMode(section),
     })),
     ...(file?.format === "html" ? [{ id: "render-selected", label: "Render selected HTML", description: "Open the sandboxed offline preview or choose an interactive VM preview.", keywords: "preview render html page browser", run: () => { setMode("Inspect"); setView("Render"); } }] : []),
+    ...(file?.format === "wasm" ? [{ id: "inspect-wasm", label: "Open WebAssembly workbench", description: "Search indexed instructions, rename functions with aliases, inspect direct calls, and navigate to original module bytes.", keywords: "wasm webassembly disassemble instruction function rename alias references", run: () => { setMode("Inspect"); setView("Wasm"); } }] : []),
     ...(file && ["html", "javascript", "css", "json", "sourcemap"].includes(file.format) ? [{ id: "beautify-selected", label: "Beautify selected evidence", description: "Create a formatted view in a worker while preserving the imported bytes.", keywords: "format prettify beautified source", disabledReason: beautifying ? "Beautify is already in progress." : file.bytes.length > 5 * 1024 * 1024 ? "Beautify supports sources up to 5 MiB." : undefined, run: () => { setMode("Inspect"); startBeautify(); } }] : []),
     {
       id: "open-welcome",
       label: "Open or show Welcome tab",
-      description: "Open the WRET Welcome page or switch to it if it is already open.",
+      description: "Open the Whidra Welcome page or switch to it if it is already open.",
       keywords: "home start getting started welcome page",
       run: selectWelcome,
     },
@@ -983,7 +1095,7 @@ export function App() {
       run: () => harInput.current?.click(),
     },
     {
-      id: "open-project", label: "Open project", description: "Open a previously exported WRET project archive.",
+      id: "open-project", label: "Open project", description: "Open a previously exported Whidra project archive.",
       keywords: "archive restore load project",
       disabledReason: busy || !ready ? "Wait for the current operation to finish." : undefined,
       run: () => archiveInput.current?.click(),
@@ -998,7 +1110,7 @@ export function App() {
       id: "export-report", label: "Export report", description: "Download a Markdown report of this investigation.",
       keywords: "markdown findings report download",
       disabledReason: !ready ? "The project is still loading." : undefined,
-      run: () => download("wret-report.md", report(project), "text/markdown"),
+      run: () => download("whidra-report.md", report(project), "text/markdown"),
     },
     {
       id: "new-project", label: "New project", description: "Start a new investigation after confirming the current project can be replaced.",
@@ -1065,14 +1177,12 @@ export function App() {
           <button
             className="brand-home"
             type="button"
-            aria-label="WRET home — open Welcome"
+            aria-label="Whidra home — open Welcome"
             title="Go to Welcome"
             onClick={selectWelcome}
           >
-            <span className="brand-logo-crop" aria-hidden="true">
-              <img src={wretLogoUrl} alt="" />
-            </span>
-            <strong>WRET</strong>
+            <img className="brand-logo" src={whidraLogoUrl} alt="" aria-hidden="true" />
+            <span className="brand-name">Whidra</span>
           </button>
           <span className="brand-caption">Web-based Reverse Engineering Tool</span>
         </div>
@@ -1129,7 +1239,7 @@ export function App() {
             focusable[nextIndex].focus();
           }}>
             <div className="command-heading">
-              <div><h2>Command palette</h2><p>Search and run a WRET command</p></div>
+              <div><h2>Command palette</h2><p>Search and run a Whidra command</p></div>
               <button className="command-close" aria-label="Close command palette" title="Close · Escape" onClick={closePalette}>×</button>
             </div>
             <input
@@ -1205,9 +1315,9 @@ export function App() {
       <input
         ref={archiveInput}
         type="file"
-        accept=".json,.wret"
+        accept=".json,.wret,.wret.json,.whidra,.whidra.json"
         className="hidden"
-        aria-label="Open WRET archive"
+        aria-label="Open Whidra project archive"
         onChange={(e) => void openArchive(e.target.files?.[0])}
       />
       <div className="projectbar">
@@ -1240,6 +1350,16 @@ export function App() {
           </button>
         </div>
       )}
+      {toolRecovery && (
+        <div role="status" className="tool-update-alert">
+          <div>
+            <strong>Update the analyzer for this project?</strong>
+            <span> Existing findings, evidence, notes, aliases, and transformations stay saved. Reanalysis replaces a result only after it succeeds.</span>
+          </div>
+          <button onClick={useInstalledAnalyzer} disabled={busy}>Use installed analyzer</button>
+          <button aria-label="Dismiss analyzer update notice" onClick={() => setToolRecovery(undefined)}>×</button>
+        </div>
+      )}
       {storageError && (
         <div role="alert" className="alert storage-alert">
           <span>{storageError}</span>
@@ -1258,9 +1378,9 @@ export function App() {
       {mode === "Overview" && (
         <section className="guided-overview">
           <div className="section-kicker">YOUR INVESTIGATION WORKSPACE</div>
-          <h1>WRET: Web-based Reverse Engineering Tool</h1>
+          <h1>Whidra — Web-based Reverse Engineering Tool</h1>
           <p>
-            A browser-based tool for inspecting web files and debugging their behavior.
+            Inspect web code, trace behavior, debug, and connect evidence in one browser-based workspace.
           </p>
           <div className="debug-toolbar">
             <button
@@ -1360,7 +1480,7 @@ export function App() {
           <div className="debug-toolbar">
             <button
               onClick={() =>
-                download("wret-report.md", report(project), "text/markdown")
+                download("whidra-report.md", report(project), "text/markdown")
               }
             >
               Export Markdown report
@@ -1498,12 +1618,13 @@ export function App() {
                     "Beautified",
                     "AST",
                     "WAT",
+                    ...(file.format === "wasm" ? ["Wasm" as View] : []),
                     "Graph",
                     "Decode",
                     ...(file.format === "html" ? ["Render" as View] : []),
                   ] as View[]
                 ).map((v) => (
-                  <Tooltip key={v} content={{Original:"View the imported source. Click the editor gutter to set or clear a breakpoint.",Hex:"Inspect the original bytes and select byte ranges.",Beautified:"Read a formatted copy; its positions do not map exactly to original evidence.",AST:"Browse the parsed syntax tree and jump to source locations.",WAT:"Read the WebAssembly text representation and navigate its sections.",Graph:"Explore links between files, functions, calls, and findings.",Decode:"Apply reversible decoding steps while retaining the original evidence.",Render:"Build an offline sandboxed HTML preview with scripts disabled."}[v]}><button
+                  <Tooltip key={v} content={{Original:"View the imported source. Click the editor gutter to set or clear a breakpoint.",Hex:"Inspect the original bytes and select byte ranges.",Beautified:"Read a formatted copy; its positions do not map exactly to original evidence.",AST:"Browse the parsed syntax tree and jump to source locations.",WAT:"Read the WebAssembly text representation and navigate its sections.",Wasm:"Browse indexed instructions, imports, exports, and direct call references. Rename functions with project-wide analyst aliases; the original module is unchanged.",Graph:"Explore links between files, functions, calls, and findings.",Decode:"Apply reversible decoding steps while retaining the original evidence.",Render:"Build an offline sandboxed HTML preview with scripts disabled."}[v]}><button
                     role="tab"
                     aria-selected={view === v}
                     className={view === v ? "active" : ""}
@@ -1512,7 +1633,8 @@ export function App() {
                       (v === "Original" && originalText === undefined) ||
                       (v === "Beautified" && !beautified[file.id] && !result?.formatted) ||
                       (v === "AST" && !result?.ast) ||
-                      (v === "WAT" && !result?.wat)
+                      (v === "WAT" && !result?.wat) ||
+                      (v === "Wasm" && !result?.wasmFunctions)
                     }
                     onClick={() => setView(v)}
                   >
@@ -1596,12 +1718,28 @@ export function App() {
                     </div>
                     <Editor
                       file={file}
-                      value={result?.wat || ""}
+                      value={displayedWat || ""}
                       original={false}
                       line={watLine}
                       onSelection={() => {}}
                     />
                   </>
+                )}
+                {view === "Wasm" && result?.wasmFunctions && (
+                  <WasmView
+                    analysis={result}
+                    aliases={project.wasmAliases || []}
+                    onAlias={(functionIndex, name) => update((p) => {
+                      const aliases = (p.wasmAliases || []).filter((a) => !(a.moduleHash === result.hash && a.functionIndex === functionIndex));
+                      if (name.trim()) aliases.push({ moduleHash: result.hash, functionIndex, name: name.trim().slice(0, 128) });
+                      return { ...p, wasmAliases: aliases };
+                    })}
+                    onBytes={(start, end) => {
+                      setLocation({ fileId: file.id, start, end });
+                      setHexPage(Math.floor(start / 512));
+                      setView("Hex");
+                    }}
+                  />
                 )}
                 {view === "Hex" && (
                   <div className="hex-view">
@@ -1881,11 +2019,11 @@ export function App() {
             </>
           ) : selected === WELCOME_TAB_ID ? (
             <div className="welcome">
-              <div className="welcome-emblem">⌘</div>
-              <div className="section-kicker">WRET: Web-based Reverse Engineering Tool</div>
-              <h1>Inspect web files and debug their behavior.</h1>
+              <img className="welcome-emblem" src={whidraLogoUrl} alt="Whidra hydra and gear logo" />
+              <div className="section-kicker">WEB-BASED REVERSE ENGINEERING TOOL</div>
+              <h1>Whidra</h1>
               <p>
-                A browser-based tool for inspecting web files and debugging their behavior.
+                Inspect web code, trace behavior, debug, and connect evidence in one browser-based workspace.
               </p>
               <button
                 className="primary large"
@@ -1937,26 +2075,42 @@ export function App() {
             <span>INVESTIGATION</span>
             <span className="teal">◎</span>
           </div>
-          <div className="inspector-tabs">
-            {(
-              [
-                "Findings",
-                "Symbols",
-                "Search",
-                "Notes",
-                "Strings",
-                "Sections",
-              ] as Panel[]
-            ).map((p) => (
-              <Tooltip key={p} content={{Findings:"Review analysis indicators and their source locations.",Symbols:"Browse functions, classes, and other parsed symbols.",Search:"Search across imported project evidence.",Notes:"Create and review annotations attached to evidence.",Strings:"Review strings extracted during static analysis.",Sections:"Inspect sections detected in WebAssembly evidence."}[p]}><button
+          <div className="inspector-evidence-context" title={file?.name || "No evidence selected"}>
+            <span>{file?.name || "No evidence selected"}</span>
+            {file?.result && !file.result.tool && <small className="legacy-result-label">Legacy analysis result · analyzer version not recorded</small>}
+            <small>{file ? `${size(file.bytes.length)} · ${file.format}` : "Choose a file in Project Explorer"}</small>
+          </div>
+          <div className="inspector-tabs" role="tablist" aria-label="Investigation tools" aria-orientation="horizontal">
+            {inspectorPanels.map((p) => (
+              <Tooltip key={p} wrapperRole="presentation" content={{Findings:"Review analysis indicators and their source locations.",Symbols:"Browse functions, classes, and other parsed symbols.",Search:"Search across all imported project evidence.",Notes:"Create and review annotations attached to evidence.",Strings:"Review strings extracted during static analysis.",Sections:"Inspect sections detected in WebAssembly evidence."}[p]}><button
+                ref={(element) => { inspectorTabRefs.current[p] = element; }}
+                id={`investigation-tab-${p.toLowerCase()}`}
+                type="button"
+                role="tab"
+                aria-label={p}
+                aria-controls="investigation-panel"
+                aria-selected={panel === p}
+                tabIndex={panel === p ? 0 : -1}
                 className={panel === p ? "active" : ""}
                 onClick={() => setPanel(p)}
+                onKeyDown={(event) => {
+                  const index = inspectorPanels.indexOf(p);
+                  const next = event.key === "ArrowRight" || event.key === "ArrowDown" ? (index + 1) % inspectorPanels.length
+                    : event.key === "ArrowLeft" || event.key === "ArrowUp" ? (index + inspectorPanels.length - 1) % inspectorPanels.length
+                      : event.key === "Home" ? 0 : event.key === "End" ? inspectorPanels.length - 1 : -1;
+                  if (next < 0) return;
+                  event.preventDefault();
+                  const nextPanel = inspectorPanels[next];
+                  setPanel(nextPanel);
+                  inspectorTabRefs.current[nextPanel]?.focus();
+                }}
               >
-                {p}
+                <span>{p}</span>
+                <small>{inspectorCount(p) === undefined ? "—" : inspectorCount(p)!.toLocaleString()}</small>
               </button></Tooltip>
             ))}
           </div>
-          <div className="inspector-content">
+          <div className="inspector-content" id="investigation-panel" role="tabpanel" aria-labelledby={`investigation-tab-${panel.toLowerCase()}`} tabIndex={0}>
             {panel !== "Search" && panel !== "Notes" && (
               <input
                 className="filter-input"
@@ -1972,12 +2126,7 @@ export function App() {
                   Observable patterns, not malware verdicts. Select an indicator
                   to review its context.
                 </p>
-                {result?.findings
-                  .filter((f) =>
-                    `${f.name} ${f.kind}`
-                      .toLowerCase()
-                      .includes(filter.toLowerCase()),
-                  )
+                {filteredFindings
                   .slice(0, resultCount)
                   .map((f) => (
                     <div className="finding-card" key={f.id}>
@@ -2030,7 +2179,7 @@ export function App() {
                       </select>
                     </div>
                   ))}
-                {(result?.findings.length || 0) > resultCount && (
+                {filteredFindings.length > resultCount && (
                   <button
                     className="more"
                     onClick={() => setResultCount((n) => n + 100)}
@@ -2038,15 +2187,7 @@ export function App() {
                     Show more
                   </button>
                 )}
-                {!result?.findings.length && (
-                  <div className="empty-small">
-                    {file
-                      ? result
-                        ? "No indicator patterns found."
-                        : "Analysis results will appear here."
-                      : "Import a file to inspect its indicators."}
-                  </div>
-                )}
+                {!filteredFindings.length && <div className="inspector-empty" role="status">{!file ? "Select evidence in Project Explorer to inspect its indicators." : !result ? "Analysis has not completed for this evidence yet." : filter ? "No findings match this filter." : "No indicator patterns were found."}</div>}
                 {!!result?.diagnostics.length && (
                   <div className="diagnostics">
                     <h3>Analysis diagnostics</h3>
@@ -2142,6 +2283,7 @@ export function App() {
                   </button>
                 </div>
                 <h3>Project notes · {project.notes.length}</h3>
+                {!project.notes.length && <p className="inspector-empty">No notes yet. Add an observation above to keep it with this project.</p>}
                 {project.notes.map((n) => (
                   <article className="note-card" key={n.id}>
                     <button
@@ -2175,7 +2317,7 @@ export function App() {
                 <button
                   className="report-button"
                   onClick={() =>
-                    download("wret-report.md", report(project), "text/markdown")
+                    download("whidra-report.md", report(project), "text/markdown")
                   }
                 >
                   ↓ Export Markdown report
@@ -2284,14 +2426,13 @@ export function App() {
         </div>
       </section>
       <footer className="statusbar">
-        <span>
-          {project.tools[0]
-            ? `${project.tools[0].id} v${project.tools[0].version}`
-            : "Tools load on demand"}
+        <span className="product-version">Whidra v{packageJson.version}</span>
+        <span className={`tool-readiness ${toolStatus}`} title={toolStatusMessage || undefined}>
+          Analyzer: {toolStatus === "checking" ? "checking" : toolStatus === "ready" ? "ready" : toolStatus === "update" ? "update required" : "unavailable"}
         </span>
         <button
           onClick={() =>
-            download("wret-report.md", report(project), "text/markdown")
+            download("whidra-report.md", report(project), "text/markdown")
           }
         >
           Export report ↗

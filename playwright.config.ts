@@ -13,6 +13,7 @@ export default defineConfig({
     command: "node scripts/serve-test.mjs",
     url: "http://127.0.0.1:4173",
     reuseExistingServer: false,
+    gracefulShutdown: { signal: "SIGINT", timeout: 1000 },
   },
   projects: [
     {

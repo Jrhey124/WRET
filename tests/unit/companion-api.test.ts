@@ -39,7 +39,7 @@ beforeAll(async () => {
       10000,
     );
     child.stdout?.on("data", (data) => {
-      if (data.toString().includes("WRET companion:")) {
+      if (data.toString().includes("Whidra companion:")) {
         clearTimeout(timer);
         resolve();
       }
@@ -115,6 +115,7 @@ describe("companion HTTP and WebSocket control access", () => {
       { ...base, files: [{ id: "a", name: "../app.js", bytes: "eCgpOw==" }] },
       { ...base, entry: "missing.html" },
       { ...base, target: "https://example.com", files: [] },
+      { ...base, wasmStringDecoders: [{ direction: "wasm-to-js", functionName: "env.decode", memoryName: "env.memory", pointerArgument: 0, lengthArgument: 0 }] },
     ]) {
       const response = await fetch(origin + "/api/sessions", {
         method: "POST",

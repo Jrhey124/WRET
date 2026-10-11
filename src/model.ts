@@ -23,6 +23,8 @@ export interface Finding extends Item {
 }
 export interface Analysis {
   hash: string;
+  /** Analyzer that produced this result. Missing on older archives means legacy provenance. */
+  tool?: ToolPin;
   strings: Item[];
   outline: Item[];
   references: Item[];
@@ -32,8 +34,27 @@ export interface Analysis {
   ast?: string;
   formatted?: string;
   wat?: string;
+  wasmFunctions?: WasmFunction[];
+  wasmInstructions?: WasmInstruction[];
+  wasmCoverage?: { decoded: number; total: number; reason?: string };
   diagnostics: string[];
 }
+export interface WasmFunction {
+  index: number;
+  imported: boolean;
+  name: string;
+  typeIndex?: number;
+  location?: Location;
+}
+export interface WasmInstruction {
+  functionIndex: number;
+  offset: number;
+  end: number;
+  opcode: string;
+  operands: string;
+  callTarget?: number;
+}
+export interface WasmAlias { moduleHash: string; functionIndex: number; name: string; }
 export interface AnalysisOptions {
   maxEntries?: number;
 }
@@ -85,7 +106,7 @@ export interface ToolPin {
   integrity: string;
 }
 export interface Project {
-  schema: 1 | 2 | 3 | 4;
+  schema: 1 | 2 | 3 | 4 | 5;
   id: string;
   name: string;
   createdAt: string;
@@ -96,6 +117,7 @@ export interface Project {
   sessions?: import("./debug-types").DebugSession[];
   breakpoints?: import("./debug-types").Breakpoint[];
   transformations?: Transformation[];
+  wasmAliases?: WasmAlias[];
 }
 export interface Job {
   id: string;
@@ -107,7 +129,7 @@ export interface Job {
 export const uid = () => crypto.randomUUID();
 export function newProject(): Project {
   return {
-    schema: 4,
+    schema: 5,
     id: uid(),
     name: "Untitled investigation",
     createdAt: new Date().toISOString(),
@@ -118,12 +140,15 @@ export function newProject(): Project {
     sessions: [],
     breakpoints: [],
     transformations: [],
+    wasmAliases: [],
   };
 }
 /** Remove one imported evidence item and project records anchored to it. */
 export function removeEvidence(project: Project, evidenceId: string): Project {
   const evidence = project.files.find((file) => file.id === evidenceId);
   if (!evidence) return project;
+  const removedModuleHash = evidence.format === "wasm" ? evidence.hash || evidence.result?.hash : undefined;
+  const remainingModuleHashes = new Set(project.files.filter((file) => file.id !== evidenceId && file.format === "wasm").map((file) => file.hash || file.result?.hash).filter((hash): hash is string => Boolean(hash)));
   return {
     ...project,
     files: project.files.filter((file) => file.id !== evidenceId).map((file) => ({
@@ -132,6 +157,7 @@ export function removeEvidence(project: Project, evidenceId: string): Project {
       derivation: file.derivation?.sourceId === evidenceId ? { ...file.derivation, sourceId: undefined } : file.derivation,
     })),
     transformations: (project.transformations || []).filter((entry) => entry.outputEvidenceId !== evidenceId).map((entry) => entry.parentEvidenceId === evidenceId ? { ...entry, parentUnavailable: true } : entry),
+    wasmAliases: removedModuleHash && !remainingModuleHashes.has(removedModuleHash) ? (project.wasmAliases || []).filter((alias) => alias.moduleHash !== removedModuleHash) : project.wasmAliases || [],
     sessions: project.sessions?.map((session) => ({ ...session, requests: session.requests?.map((request) => request.evidenceId === evidenceId ? { ...request, evidenceId: undefined, truncated: true } : request) })),
     notes: project.notes.filter((note) => note.location.fileId !== evidenceId),
     decodes: project.decodes.filter((decode) => decode.location.fileId !== evidenceId),

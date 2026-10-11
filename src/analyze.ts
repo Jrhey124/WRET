@@ -7,6 +7,7 @@ import * as estree from "prettier/plugins/estree";
 import * as htmlPlugin from "prettier/plugins/html";
 import * as postcssPlugin from "prettier/plugins/postcss";
 import wabtFactory from "wabt";
+import { indexWasm } from "./wasm-index";
 import {
   decodeText,
   offsetToByte,
@@ -382,6 +383,15 @@ export async function analyzeFile(
   if (file.format === "wasm") {
     progress("Inspecting WASM sections");
     try {
+      const index = indexWasm(bytes, fileId);
+      result.wasmFunctions = index.functions;
+      result.wasmInstructions = index.instructions;
+      result.wasmCoverage = { decoded: index.instructions.length, total: index.total, reason: index.reason };
+      if (index.reason) result.diagnostics.push(`WASM instruction index: ${index.reason}`);
+    } catch (error) {
+      result.diagnostics.push(`WASM instruction index: ${String(error)}`);
+    }
+    try {
       result.sections = wasmSections(bytes, fileId);
     } catch (error) {
       result.diagnostics.push(`WASM sections: ${String(error)}`);
@@ -405,6 +415,7 @@ export async function analyzeFile(
       }
       const lines = result.wat.split("\n");
       let functionIndex = 0;
+      let importedFunctionIndex = 0;
       for (
         let line = 0;
         line < lines.length && result.outline.length < maxEntries;
@@ -413,6 +424,11 @@ export async function analyzeFile(
         const match = lines[line].match(/^  \((import|export|func)\s+(.*)/);
         if (!match) continue;
         const kind = match[1];
+        if (kind === "import" && /\(func\s/.test(match[2])) {
+          const imported = result.wasmFunctions?.filter((fn) => fn.imported)[importedFunctionIndex++];
+          const watName = match[2].match(/\$[^\s()]+/)?.[0];
+          if (imported && watName) imported.name = watName;
+        }
         const section = result.sections.find(
           (s) =>
             s.kind ===
@@ -428,6 +444,12 @@ export async function analyzeFile(
                 functionIndex++
               ]
             : undefined;
+        if (kind === "func" && body) {
+          const indexed = result.wasmFunctions?.filter((fn) => !fn.imported)[functionIndex - 1]
+            || result.wasmFunctions?.find((fn) => fn.location?.start === body.location.start);
+          const watName = match[2].match(/\$[^\s()]+/)?.[0];
+          if (indexed && watName) indexed.name = watName;
+        }
         result.outline.push({
           ...item(
             match[2].slice(0, 180),

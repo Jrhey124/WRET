@@ -5,10 +5,12 @@ import {
   type DebugCommand,
   type DebugSession,
   type Observation,
+  type WasmStringDecoder,
 } from "./debug-types";
 import {
   type Project,
   type Evidence,
+  FILE_LIMIT,
   detectFormat,
   uid,
   sha256,
@@ -64,8 +66,17 @@ export function DebugPanel({
   const [exceptionState, setExceptionState] = useState<
     "none" | "uncaught" | "all"
   >("none");
+  const [monitorWasmBridge, setMonitorWasmBridge] = useState(false);
+  const [captureWasmModules, setCaptureWasmModules] = useState(false);
+  const [wasmStringDecoders, setWasmStringDecoders] = useState<WasmStringDecoder[]>([]);
+  const [decoderFunction, setDecoderFunction] = useState("");
+  const [decoderMemory, setDecoderMemory] = useState("");
+  const [decoderDirection, setDecoderDirection] = useState<WasmStringDecoder["direction"]>("wasm-to-js");
+  const [decoderPointer, setDecoderPointer] = useState("0");
+  const [decoderLength, setDecoderLength] = useState("");
   const [watches, setWatches] = useState<string[]>([]),
     [watchValues, setWatchValues] = useState<Record<string, unknown>>({});
+  const [bridgeFilter, setBridgeFilter] = useState("");
   const selectedEvidence = project.files.filter(
     (f) => selection[f.id] ?? !f.name.startsWith("runtime/"),
   );
@@ -88,6 +99,17 @@ export function DebugPanel({
   }
   const [status, setStatus] = useState("No active session");
   const activeProjectSession = (project.sessions || []).find((session) => ["starting", "running", "paused"].includes(session.status));
+  async function companionJson(response: Response) {
+    const contentType = response.headers.get("content-type") || "";
+    if (!contentType.toLowerCase().includes("application/json")) {
+      if (contentType.toLowerCase().includes("text/html")) {
+        throw new Error("The companion endpoint returned a web page instead of its API response. Start Whidra with npm run companion and open the companion's local address; static hosting supports inspection only.");
+      }
+      throw new Error(`The companion returned an unexpected response type (${contentType || "unknown"}). Check that the local companion is running at this address.`);
+    }
+    try { return await response.json(); }
+    catch { throw new Error("The companion returned malformed JSON. Restart the local companion and try reconnecting."); }
+  }
   async function api(path: string, body?: unknown) {
     const response = await fetch("/api/" + path, {
       method: body === undefined ? "GET" : "POST",
@@ -97,7 +119,7 @@ export function DebugPanel({
       },
       body: body === undefined ? undefined : JSON.stringify(body),
     });
-    const result = await response.json();
+    const result = await companionJson(response);
     if (!response.ok)
       throw new Error(result.error || "Companion request failed");
     return result;
@@ -199,10 +221,11 @@ export function DebugPanel({
     if (observation.kind === "pausePolicy" && typeof rawData?.skip === "boolean") setSkippingPauses(rawData.skip);
     const candidateData = rawData && typeof rawData === "object" ? { ...rawData } : rawData;
     let resourceBytes: Uint8Array | undefined;
-    if (candidateData && (observation.kind === "resource" || observation.kind === "response") && typeof candidateData.body === "string") {
+    if (candidateData && (["resource", "response", "wasmModule"].includes(observation.kind)) && typeof candidateData.body === "string") {
       try {
         const encoded = candidateData.body as string;
-        if (encoded.length <= 1_400_000 && encoded.length % 4 === 0 && /^[A-Za-z0-9+/]*={0,2}$/.test(encoded))
+        const maxEncoded = observation.kind === "wasmModule" ? Math.ceil(FILE_LIMIT / 3) * 4 : 1_400_000;
+        if (encoded.length <= maxEncoded && encoded.length % 4 === 0 && /^[A-Za-z0-9+/]*={0,2}$/.test(encoded))
           resourceBytes = Uint8Array.from(atob(encoded), (character) => character.charCodeAt(0));
       } catch { resourceBytes = undefined; }
     } else if ((observation.kind === "script" || observation.kind === "liveEdit" && candidateData?.status === "Ok" && !candidateData?.dryRun) && typeof candidateData?.source === "string") {
@@ -211,13 +234,18 @@ export function DebugPanel({
       resourceBytes = new TextEncoder().encode(JSON.stringify(portableObservation(candidateData), null, 2));
     }
     let resourceEvidence: Evidence | undefined;
-    if (resourceBytes && resourceBytes.length <= 1024 * 1024) {
+    const resourceLimit = observation.kind === "wasmModule" ? FILE_LIMIT : 1024 * 1024;
+    if (resourceBytes && resourceBytes.length <= resourceLimit) {
       const hash = await sha256(resourceBytes);
       const existing = current.current.files.find((file) => file.hash === hash);
       const rawUrl = typeof candidateData.url === "string" ? candidateData.url : "";
+      const wasmResponse = resourceBytes.length >= 4 && resourceBytes[0] === 0 && resourceBytes[1] === 97 && resourceBytes[2] === 115 && resourceBytes[3] === 109;
+      if (wasmResponse) candidateData.detectedFormat = "wasm";
       const extension = (() => {
         if (observation.kind === "snapshot") return "json";
+        if (observation.kind === "wasmModule") return "wasm";
         if (observation.kind === "script" || observation.kind === "liveEdit") return "js";
+        if (wasmResponse || String(candidateData.mimeType || "").toLowerCase().split(";")[0].trim() === "application/wasm") return "wasm";
         try { return new URL(rawUrl).pathname.split("/").pop()?.match(/\.([a-zA-Z0-9]{1,8})$/)?.[1]?.toLowerCase() || "bin"; }
         catch { return "bin"; }
       })();
@@ -232,13 +260,13 @@ export function DebugPanel({
         if (original) resourceEvidence.derivation = { sourceId: original.id, sourceHash: original.hash!, recipe: "live-edit", createdAt: observation.time, changes: 1 };
       }
       candidateData.evidenceId = resourceEvidence.id;
-      if (observation.kind === "resource" || observation.kind === "response") delete candidateData.body;
+      if (observation.kind === "resource" || observation.kind === "response" || observation.kind === "wasmModule") delete candidateData.body;
       if (observation.kind === "script" || observation.kind === "liveEdit") delete candidateData.source;
     } else if (resourceBytes) {
       candidateData.truncated = true;
       delete candidateData.body;
       delete candidateData.source;
-    } else if (candidateData && (observation.kind === "resource" || observation.kind === "response")) {
+    } else if (candidateData && (["resource", "response", "wasmModule"].includes(observation.kind))) {
       candidateData.truncated = true;
       delete candidateData.body;
     }
@@ -260,6 +288,9 @@ export function DebugPanel({
           requests: [],
           capturedBytes: 0,
           truncated: false,
+          wasmBridgeMonitor: monitorWasmBridge,
+          wasmModuleCapture: captureWasmModules,
+          wasmStringDecoders: [...wasmStringDecoders],
         });
       }
       const existing = sessions[index];
@@ -319,7 +350,7 @@ export function DebugPanel({
         requests: updateCapturedRequests(existing.requests || [], { ...storedObservation, data: candidateData }),
       };
       const files = evidenceAllowed && resourceEvidence && !hasResource ? [...p.files, resourceEvidence] : evidenceAllowed && resourceEvidence && candidateData?.url ? p.files.map((file) => file.id === resourceEvidence!.id && !file.runtimeUrl ? { ...file, runtimeUrl: safeCapturedUrl(candidateData.url) || undefined } : file) : p.files;
-      return { ...p, schema: 4, sessions, files };
+      return { ...p, schema: 5, sessions, files };
     });
     const data = observation.data as any;
     if (newest && observation.kind === "paused") {
@@ -345,7 +376,7 @@ export function DebugPanel({
         throw new Error(
           "Start the local companion with npm run companion. The static server supports inspection only.",
         );
-      token.current = (await response.json()).token;
+      token.current = (await companionJson(response)).token;
       setCapabilities(await api("capabilities"));
       socket.current?.close();
       const ws = new WebSocket(
@@ -468,6 +499,9 @@ export function DebugPanel({
         breakpoints: current.current.breakpoints || [],
         approvals: approved,
         exceptionState,
+        monitorWasmBridge,
+        captureWasmModules,
+        wasmStringDecoders,
       });
       activeId.current = result.id;
     } catch (error) {
@@ -506,6 +540,7 @@ export function DebugPanel({
     .flatMap((s) => s.observations)
     .slice(-100)
     .reverse();
+  const bridgeEvents = (project.sessions || []).flatMap((session) => session.observations.filter((o) => o.kind === "wasmBridge").map((o) => ({ ...o, sessionId: session.id }))).slice(-500).reverse().filter((o) => !bridgeFilter || JSON.stringify(o.data).toLowerCase().includes(bridgeFilter.toLowerCase()));
   return (
     <section className="debug-workspace" hidden={!active}>
       <div className="section-kicker">ISOLATED DYNAMIC INVESTIGATION</div>
@@ -627,6 +662,29 @@ export function DebugPanel({
             JavaScript uses a browser module harness; Node.js APIs are
             unavailable.
           </p>
+          <label className="runtime-option">
+            <input type="checkbox" checked={monitorWasmBridge} onChange={(event) => setMonitorWasmBridge(event.target.checked)} disabled={pending || Boolean(activeProjectSession)} />
+            Monitor JavaScript/WebAssembly calls before execution
+          </label>
+          <p className="view-help">Opt-in instrumentation wraps supported WebAssembly instantiate paths and may change function identity and timing. It records bounded argument summaries (numbers remain numbers); direct instance access and calls internal to Wasm may not be observed. Monitoring is installed before the page starts.</p>
+          <details className="wasm-decoder-settings">
+            <summary>UTF-8 pointer decoders Â· {wasmStringDecoders.length} configured</summary>
+            <p className="view-help">Add exact function names such as <code>env.readString</code> or an exported function name. Choose an imported/exported memory name reported by the module. A blank length index uses a bounded NUL-terminated read. Output is capped at 4 KiB per argument.</p>
+            <label>Bridge function name<input aria-label="Decoder function name" maxLength={200} value={decoderFunction} onChange={(e) => setDecoderFunction(e.target.value)} placeholder="env.readString" /></label>
+            <label>Memory name<input aria-label="Decoder memory name" maxLength={200} value={decoderMemory} onChange={(e) => setDecoderMemory(e.target.value)} placeholder="env.memory" /></label>
+            <label>Direction<select aria-label="Decoder direction" value={decoderDirection} onChange={(e) => setDecoderDirection(e.target.value as WasmStringDecoder["direction"])}><option value="wasm-to-js">Wasm â†’ JavaScript</option><option value="js-to-wasm">JavaScript â†’ Wasm</option></select></label>
+            <label>Pointer argument index<input aria-label="Decoder pointer argument index" type="number" min="0" max="15" value={decoderPointer} onChange={(e) => setDecoderPointer(e.target.value)} /></label>
+            <label>Length argument index (optional)<input aria-label="Decoder length argument index" type="number" min="0" max="15" value={decoderLength} onChange={(e) => setDecoderLength(e.target.value)} placeholder="Blank: NUL-terminated" /></label>
+            <button type="button" disabled={pending || Boolean(activeProjectSession) || wasmStringDecoders.length >= 20} onClick={() => {
+              const pointerArgument = Number(decoderPointer), lengthArgument = decoderLength === "" ? undefined : Number(decoderLength);
+              if (!decoderFunction.trim() || !decoderMemory.trim() || !Number.isInteger(pointerArgument) || pointerArgument < 0 || pointerArgument > 15 || (lengthArgument !== undefined && (!Number.isInteger(lengthArgument) || lengthArgument < 0 || lengthArgument > 15 || lengthArgument === pointerArgument))) { setError("Enter a function and memory name, a pointer argument from 0â€“15, and an optional different length argument from 0â€“15."); return; }
+              setWasmStringDecoders((rules) => [...rules, { direction: decoderDirection, functionName: decoderFunction.trim(), memoryName: decoderMemory.trim(), pointerArgument, ...(lengthArgument === undefined ? {} : { lengthArgument }) }]);
+              setError("");
+            }}>Add UTF-8 decoder rule</button>
+            <ul>{wasmStringDecoders.map((rule, index) => <li key={`${rule.functionName}:${rule.direction}:${index}`}>{rule.direction} Â· {rule.functionName} Â· {rule.memoryName} Â· ptr arg {rule.pointerArgument}{rule.lengthArgument === undefined ? " Â· NUL-terminated" : ` Â· length arg ${rule.lengthArgument}`} <button type="button" aria-label={`Remove decoder rule for ${rule.functionName}`} onClick={() => setWasmStringDecoders((rules) => rules.filter((_, i) => i !== index))}>Remove</button></li>)}</ul>
+          </details>
+          <label className="runtime-option"><input type="checkbox" checked={captureWasmModules} onChange={(event) => setCaptureWasmModules(event.target.checked)} disabled={pending || Boolean(activeProjectSession)} />Capture complete WebAssembly modules discovered at runtime (up to 25 MiB each)</label>
+          <p className="view-help">Uses Chromium’s Wasm script-source API and is separate from the 1 MiB network response capture. Larger modules are recorded as truncated metadata, never as complete evidence.</p>
           <label>
             Network destination
             <input
@@ -905,6 +963,15 @@ export function DebugPanel({
           ))}
         </section>
       </div>
+      <section className="bridge-monitor" aria-labelledby="wasm-bridge-heading">
+        <h2 id="wasm-bridge-heading">JavaScript / WebAssembly boundary</h2>
+        <p>Calls recorded by opt-in wrappers installed before page execution. Direct instance access and Wasm-internal calls are not observed. Numeric pointers are shown as numbers; no memory decoding rule is applied automatically. The page can access the instrumentation binding and may forge events, so treat this stream as investigative leads rather than tamper-proof proof.</p>
+        <label>Filter boundary events <input value={bridgeFilter} onChange={(event) => setBridgeFilter(event.target.value)} placeholder="Function, direction, argument…" /></label>
+        {bridgeEvents.length ? bridgeEvents.slice(0, 100).map((event) => {
+          const data = event.data as any;
+          return <details key={`${event.sessionId}:${event.sequence}`}><summary>{event.time} · {data.direction || "monitor"} · {data.function || data.memoryName || data.detail || data.phase} {data.phase === "enter" ? `(${(data.args || []).map(String).join(", ")})` : ""}</summary>{(data.decodedArguments || []).map((decoded: any, index: number) => <p key={index} className="view-help">UTF-8 · {decoded.memoryName}: {decoded.error || JSON.stringify(decoded.text)}{decoded.truncated ? " (truncated at 4 KiB/bounds)" : ""}</p>)}<pre>{JSON.stringify(data, null, 2)}</pre><button onClick={() => setBridgeFilter(String(data.function || data.moduleId || ""))}>Filter this function</button></details>;
+        }) : <p className="empty-small">No boundary events captured. Enable the monitor before starting a VM session that loads WebAssembly.</p>}
+      </section>
       <h2>Saved observations</h2>
       <p>
         Latest 100 observations shown. Full captured evidence is included in
