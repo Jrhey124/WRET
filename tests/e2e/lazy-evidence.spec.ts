@@ -1,0 +1,33 @@
+import { writeFile } from "node:fs/promises";
+import { test, expect } from "@playwright/test";
+
+test("large stored sources reopen in pages, search navigates exact bytes, and hex reads a range", async ({ page }, testInfo) => {
+  const bytes = Buffer.alloc(3 * 1024 * 1024, 32);
+  bytes.write("// original evidence", 0);
+  const offset = 256 * 1024 + 40;
+  bytes.write("page-marker-unique", offset);
+  await page.goto("/");
+  await page.getByLabel("Import evidence files").setInputFiles({ name: "large.js", mimeType: "text/javascript", buffer: bytes });
+  await expect(page.getByRole("button", { name: "Delete large.js", exact: true })).toBeEnabled();
+  await expect(page.getByLabel("Paged large source viewer")).toBeVisible();
+  await page.waitForTimeout(1600);
+  await page.reload();
+  const source = page.getByLabel("Paged large source viewer");
+  await expect(source).toBeVisible();
+  await expect(source.locator("pre")).toContainText("original evidence");
+  await expect(page.locator(".monaco-editor")).toHaveCount(0);
+  await page.getByRole("tab", { name: "Search", exact: true }).click();
+  await page.getByLabel("Project search").fill("page-marker-unique");
+  await page.locator(".inspector .evidence-row button").first().click();
+  await expect(source.locator("pre")).toContainText("page-marker-unique");
+  await page.getByRole("tab", { name: "Hex", exact: true }).click();
+  await page.getByLabel("Hex byte offset").fill(String(offset));
+  await page.getByRole("button", { name: "Go", exact: true }).click();
+  await expect(page.locator(".hex-view")).toContainText("page-mar");
+  const cdp = await page.context().newCDPSession(page);
+  await cdp.send("Performance.enable");
+  const metrics = await cdp.send("Performance.getMetrics");
+  await testInfo.attach("browser-heap-after-paged-reopen", { body: JSON.stringify(metrics.metrics.filter((metric: { name: string }) => /JSHeap|Nodes|Documents/.test(metric.name))), contentType: "application/json" });
+  await writeFile(testInfo.outputPath("browser-memory.json"), JSON.stringify(metrics.metrics.filter((metric: { name: string }) => /JSHeap|Nodes|Documents/.test(metric.name)), null, 2));
+  await cdp.detach();
+});

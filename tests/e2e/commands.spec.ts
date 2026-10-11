@@ -28,14 +28,14 @@ test("command palette filters, navigates by keyboard, closes accessibly, and pre
   await search.fill("there is no matching command");
   await expect(page.getByText(/No commands match/)).toBeVisible();
   await expect(page.getByRole("option")).toHaveCount(0);
-  await search.fill("debug");
-  const debug = page.getByRole("option", { name: /Go to Debug/ });
+  await search.fill("Go to Observations");
+  const debug = page.getByRole("option", { name: /Go to Observations/ });
   await expect(debug).toHaveAttribute("aria-selected", "true");
   await page.keyboard.press("ArrowDown");
   await expect(debug).toHaveAttribute("aria-selected", "true");
   await page.keyboard.press("Enter");
   await expect(dialog).toHaveCount(0);
-  await expect(page.getByRole("navigation", { name: "Investigation workflow" }).getByRole("button", { name: "Debug", exact: true })).toHaveClass(/active/);
+  await expect(page.getByRole("navigation", { name: "Investigation workflow" }).getByRole("button", { name: "Observations", exact: true })).toHaveClass(/active/);
   await expect(trigger).toBeFocused();
 
   await page.keyboard.press("Control+k");

@@ -33,6 +33,16 @@ test("Whidra logo, Welcome tab, and Investigation tabs remain readable and keybo
   await expect(tabs).toHaveCount(6);
   await expect(page.locator(".inspector-evidence-context")).toContainText("sidebar.js");
   await expect(tabs.nth(0)).toHaveAttribute("aria-selected", "true");
+  await page.evaluate(() => { document.documentElement.style.zoom = "2"; });
+  await home.focus();
+  await page.keyboard.press("Enter");
+  await expect(page.getByRole("tab", { name: "Welcome" })).toHaveAttribute("aria-selected", "true");
+  await expect(welcomeLogo).toBeVisible();
+  const fullLogo = await welcomeLogo.evaluate(element => {
+    const image = element.getBoundingClientRect(), parent = element.closest(".welcome")!.getBoundingClientRect();
+    return image.top >= parent.top && image.bottom <= parent.bottom;
+  });
+  expect(fullLogo).toBe(true);
   await tabs.nth(0).focus();
   await page.keyboard.press("ArrowRight");
   await expect(tabs.nth(1)).toHaveAttribute("aria-selected", "true");

@@ -61,19 +61,7 @@ test("guided workflow preserves folder paths, links dependencies and maps, and r
     page.getByRole("dialog", { name: "Command palette" }),
   ).toBeVisible();
   await page.keyboard.press("Escape");
-  await page
-    .getByRole("navigation", { name: "Investigation workflow" })
-    .getByRole("button", { name: "Debug", exact: true })
-    .click();
-  await page
-    .getByRole("button", { name: "Check companion / reconnect" })
-    .click();
-  await expect(
-    page.locator(".debug-workspace").getByRole("alert"),
-  ).toContainText("Start the local companion");
-  await expect(
-    page.getByRole("button", { name: "Start session", exact: true }),
-  ).toBeDisabled();
+  await expect(page.getByRole("button", { name: "Debug", exact: true })).toHaveCount(0);
   await page
     .getByRole("navigation", { name: "Investigation workflow" })
     .getByRole("button", { name: "Report", exact: true })

@@ -6,4 +6,3 @@ playwright-report/
 *.local
 dist-companion/
 .wret-vm/
-guest/__pycache__/

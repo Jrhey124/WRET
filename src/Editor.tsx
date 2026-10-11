@@ -1,3 +1,5 @@
+import { readEvidenceRange } from "./storage";
+import { evidenceSize } from "./model";
 import { useEffect, useRef, useState } from "react";
 import * as monaco from "monaco-editor/editor";
 import EditorWorker from "monaco-editor/editor/editor.worker?worker";
@@ -33,8 +35,6 @@ export function Editor({
   location,
   line,
   onSelection,
-  onBreakpoint,
-  breakpointLines = [],
 }: {
   file: Evidence;
   value: string;
@@ -42,25 +42,33 @@ export function Editor({
   location?: Location;
   line?: number;
   onSelection: (l: Location) => void;
-  onBreakpoint?: (line: number) => void;
-  breakpointLines?: number[];
 }) {
   const host = useRef<HTMLDivElement>(null);
   const [page, setPage] = useState(0);
   const editor = useRef<monaco.editor.IStandaloneCodeEditor | null>(null);
   const selectionCallback = useRef(onSelection);
   selectionCallback.current = onSelection;
-  const breakpointCallback = useRef(onBreakpoint);
-  breakpointCallback.current = onBreakpoint;
-  const decorations = useRef<string[]>([]);
-  const paged = original && file.bytes.length > 2 * 1024 * 1024;
+  const paged = original && evidenceSize(file) > 2 * 1024 * 1024;
   const pageBytes = 256 * 1024;
   const pageStart = page * pageBytes;
-  let pageEnd = Math.min(file.bytes.length, pageStart + pageBytes);
-  while (pageEnd < file.bytes.length && (file.bytes[pageEnd] & 0xc0) === 0x80) pageEnd++;
-  let textStart = pageStart;
-  while (textStart < pageEnd && (file.bytes[textStart] & 0xc0) === 0x80) textStart++;
-  const pageText = paged ? new TextDecoder().decode(file.bytes.subarray(textStart, pageEnd)) : "";
+  const [pageData, setPageData] = useState<Uint8Array>();
+  const [pageError, setPageError] = useState("");
+  useEffect(() => {
+    if (!paged) return;
+    let active = true; setPageData(undefined); setPageError("");
+    const end = Math.min(evidenceSize(file), pageStart + pageBytes + 4);
+    const load = file.bytes.length === evidenceSize(file) ? Promise.resolve(file.bytes.slice(pageStart, end)) : readEvidenceRange(file.id, pageStart, end);
+    load.then(bytes => { if (active) setPageData(bytes); }).catch(error => { if (active) setPageError(String(error)); });
+    return () => { active = false; };
+  }, [file.id, pageStart, paged]);
+  const data = pageData || new Uint8Array();
+  let from = 0, to = Math.min(data.length, pageBytes);
+  while (from < to && (data[from] & 0xc0) === 0x80) from++;
+  while (to < data.length && (data[to] & 0xc0) === 0x80) to++;
+  const textStart = pageStart + from, pageEnd = pageStart + to;
+  let pageText = "", encodingError = "";
+  try { pageText = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(data.subarray(from, to)); }
+  catch { encodingError = "This page is not valid UTF-8. Use Hex to inspect its original bytes."; }
   useEffect(() => setPage(0), [file.id]);
   useEffect(() => { if (paged && location?.fileId === file.id) setPage(Math.floor(location.start / pageBytes)); }, [paged, file.id, location?.fileId, location?.start]);
   useEffect(() => {
@@ -80,7 +88,7 @@ export function Editor({
       model,
       theme: "wret",
       readOnly: true,
-      glyphMargin: original && file.format === "javascript",
+      glyphMargin: false,
       automaticLayout: true,
       minimap: { enabled: false },
       fontSize: 13,
@@ -109,36 +117,13 @@ export function Editor({
         end: offsetToByte(value, end),
       });
     });
-    const gutter = instance.onMouseDown((event) => {
-      if (
-        event.target.type ===
-          monaco.editor.MouseTargetType.GUTTER_GLYPH_MARGIN &&
-        event.target.position
-      )
-        breakpointCallback.current?.(event.target.position.lineNumber);
-    });
     return () => {
-      gutter.dispose();
-      decorations.current = [];
       listener.dispose();
       instance.dispose();
       model.dispose();
       editor.current = null;
     };
   }, [file.id, file.format, value, original]);
-  useEffect(() => {
-    if (!editor.current) return;
-    decorations.current = editor.current.deltaDecorations(
-      decorations.current,
-      breakpointLines.map((line) => ({
-        range: new monaco.Range(line, 1, line, 1),
-        options: {
-          glyphMarginClassName: "wret-breakpoint",
-          glyphMarginHoverMessage: { value: "Breakpoint: click to remove" },
-        },
-      })),
-    );
-  }, [breakpointLines, file.id, value]);
   useEffect(() => {
     const instance = editor.current,
       model = instance?.getModel();
@@ -162,8 +147,10 @@ export function Editor({
     }
   }, [file, location, original, line]);
   if (paged) return <div className="large-source-page" aria-label="Paged large source viewer">
-    <div className="large-source-toolbar"><strong>{file.format.toUpperCase()} · large file paging</strong><button disabled={page === 0} onClick={() => setPage((value) => Math.max(0, value - 1))}>Previous page</button><span>Page {page + 1} of {Math.ceil(file.bytes.length / pageBytes)}</span><button disabled={pageEnd >= file.bytes.length} onClick={() => setPage((value) => value + 1)}>Next page</button><span>Bytes {textStart.toLocaleString()}–{pageEnd.toLocaleString()}</span></div>
-    <p className="panel-help">Large evidence is shown in 256 KiB pages to keep the editor responsive. Breakpoints and syntax coloring are available in Monaco for files up to 2 MiB.</p>
+    <div className="large-source-toolbar"><strong>{file.format.toUpperCase()} · large file paging</strong><button disabled={page === 0} onClick={() => setPage((value) => Math.max(0, value - 1))}>Previous page</button><span>Page {page + 1} of {Math.ceil(evidenceSize(file) / pageBytes)}</span><button disabled={pageStart + pageBytes >= evidenceSize(file)} onClick={() => setPage((value) => value + 1)}>Next page</button><span>Bytes {textStart.toLocaleString()}–{pageEnd.toLocaleString()}</span></div>
+    <p className="panel-help">Large evidence is shown in 256 KiB pages to keep the editor responsive. Syntax coloring is available in Monaco for files up to 2 MiB.</p>
+    {(pageError || encodingError) && <p role="alert">{pageError || encodingError}</p>}
+    {!pageData && !pageError && <p role="status">Loading source page?</p>}
     <pre onMouseUp={() => {
       const selection = window.getSelection();
       if (!selection || selection.isCollapsed || !selection.anchorNode || selection.anchorNode !== selection.focusNode || selection.anchorNode.nodeType !== Node.TEXT_NODE) return;

@@ -1,3 +1,4 @@
+import { acquireWorker } from "./worker-queue";
 import { sha256, type Evidence, type Analysis, type ToolPin } from "./model";
 // Sample controlled work always has a short wall clock budget. Network fetches
 // for the first party analyzer have separate deadlines below.
@@ -71,10 +72,11 @@ export async function runAnalysis(
   const bytes = new Uint8Array(await response.arrayBuffer());
   if ((await sha256(bytes)) !== trusted.integrity) throw new Error("Tool integrity check failed; refusing to start worker");
   signal.throwIfAborted();
+  const release = await acquireWorker(signal);
   const url = URL.createObjectURL(
     new Blob([bytes], { type: "text/javascript" }),
   );
-  return new Promise((resolve, reject) => {
+  return new Promise<Analysis>((resolve, reject) => {
     let worker: Worker;
     try {
       worker = new Worker(url);
@@ -144,5 +146,5 @@ export async function runAnalysis(
       } catch (error) { fail(error); }
     };
     void send();
-  });
+  }).finally(release);
 }

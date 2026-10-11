@@ -1,4 +1,7 @@
-import { useEffect, useState } from "react";
+import { readEvidenceRange } from "./storage";
+import { materializeEvidence } from "./storage";
+import { evidenceSize } from "./model";
+import { useEffect, useRef, useState } from "react";
 import { decodeText, PROJECT_LIMIT, sha256, uid, type Evidence, type Item, type Location, type Project, type Transformation } from "./model";
 import { observedContracts, RECIPES, snapshotDifferences, workspaceReferences, type Recipe, type TransformPreview } from "./gap-analysis";
 import { runResearchJob } from "./research-runtime";
@@ -17,6 +20,9 @@ export function ResearchView({ project, selection, update, navigate }: {
   const [error, setError] = useState("");
   const [message, setMessage] = useState("");
   const [busy, setBusy] = useState(false);
+  const job = useRef(new AbortController());
+  const beginJob = () => { job.current.abort(); job.current = new AbortController(); };
+  useEffect(() => () => job.current.abort(), []);
   const [query, setQuery] = useState("");
   const [index, setIndex] = useState<ReturnType<typeof workspaceReferences>>();
   const [potential, setPotential] = useState<Item[]>([]);
@@ -31,22 +37,25 @@ export function ResearchView({ project, selection, update, navigate }: {
     if (!selection || selection.end <= selection.start || selection.end - selection.start > 256) return;
     const selectedFile = project.files.find((candidate) => candidate.id === selection.fileId);
     if (!selectedFile) return;
-    const text = decodeText(selectedFile.bytes.subarray(selection.start, selection.end)).trim();
-    if (text && text.length <= 256 && !/[\r\n]/.test(text)) setQuery(text);
+    let active = true;
+    const read = selectedFile.bytes.length === evidenceSize(selectedFile) ? Promise.resolve(selectedFile.bytes.slice(selection.start, selection.end)) : readEvidenceRange(selectedFile.id, selection.start, selection.end);
+    void read.then(bytes => { const text = decodeText(bytes).trim(); if (active && text && text.length <= 256 && !/[\r\n]/.test(text)) setQuery(text); }).catch(cause => { if (active) setError(String(cause)); });
+    return () => { active = false; };
   }, [selection?.fileId, selection?.start, selection?.end, project.files]);
   function clearDraft() { setDrafts([]); setDraftContext(undefined); setMessage(""); }
   async function preview() {
-    setBusy(true); setError(""); clearDraft();
+    beginJob(); setBusy(true); setError(""); clearDraft();
     try {
       const chosen = scope === "workspace" ? files : file ? [file] : [];
       if (!chosen.length) throw new Error("Import JavaScript evidence first.");
-      if (chosen.length > 50 || chosen.reduce((sum, file) => sum + file.bytes.length, 0) > 8 * 1024 * 1024) throw new Error("Preview is limited to 50 files and 8 MiB. Choose a smaller file set.");
+      if (chosen.length > 50 || chosen.reduce((sum, file) => sum + evidenceSize(file), 0) > 8 * 1024 * 1024) throw new Error("Preview is limited to 50 files and 8 MiB. Choose a smaller file set.");
       const results: Draft[] = [];
-      for (const original of chosen) {
+      for (const metadata of chosen) {
+        const original = await materializeEvidence(metadata);
         await new Promise((resolve) => setTimeout(resolve, 0));
         const selected = scope === "selection" && selectionAvailable && selection ? selection : undefined;
         if (scope === "selection" && !selected) throw new Error("Select a code range in Inspect first.");
-        const preview = await runResearchJob<TransformPreview>({ action: "transform", bytes: original.bytes, recipe, location: selected });
+        const preview = await runResearchJob<TransformPreview>({ action: "transform", bytes: original.bytes, recipe, location: selected }, job.current.signal);
         results.push({ file: original, hash: await sha256(original.bytes), preview, inputRange: selected ? { start: selected.start, end: selected.end } : { start: 0, end: original.bytes.length } });
       }
       setDrafts(results); setDraftContext({ projectId: project.id, recipe });
@@ -54,21 +63,29 @@ export function ResearchView({ project, selection, update, navigate }: {
     } catch (error) { setError(String(error)); } finally { setBusy(false); }
   }
   async function buildIndex() {
-    setBusy(true); setError("");
-    try { setIndex(await runResearchJob<ReturnType<typeof workspaceReferences>>({ action: "index", files: project.files })); }
+    beginJob(); setBusy(true); setError("");
+    try {
+      const files: Evidence[] = []; let bytes = 0; const skipped: string[] = [];
+      for (const file of project.files) {
+        if (evidenceSize(file) > 1024 * 1024 || bytes + evidenceSize(file) > 16 * 1024 * 1024) { skipped.push(file.name); continue; }
+        files.push(await materializeEvidence(file)); bytes += evidenceSize(file);
+      }
+      const result = await runResearchJob<ReturnType<typeof workspaceReferences>>({ action: "index", files }, job.current.signal);
+      setIndex({ ...result, diagnostics: [...result.diagnostics, ...skipped.map(name => "Skipped " + name + ": reference budget reached")] });
+    }
     catch (error) { setError(String(error)); }
     finally { setBusy(false); }
   }
   async function findRelated() {
     if (!query.trim() || query.length > 4096) return;
-    setBusy(true); setError(""); setPotential([]); setHeaderHits([]);
+    beginJob(); setBusy(true); setError(""); setPotential([]); setHeaderHits([]);
     try {
       const eligible: Evidence[] = []; let budget = 0;
       for (const candidate of project.files) {
-        if (candidate.bytes.length > 1024 * 1024 || budget + candidate.bytes.length > 16 * 1024 * 1024) continue;
-        eligible.push(candidate); budget += candidate.bytes.length;
+        if (evidenceSize(candidate) > 1024 * 1024 || budget + evidenceSize(candidate) > 16 * 1024 * 1024) continue;
+        eligible.push(await materializeEvidence(candidate)); budget += evidenceSize(candidate);
       }
-      setPotential(await runResearchJob<Item[]>({ action: "potential", files: eligible, query }));
+      setPotential(await runResearchJob<Item[]>({ action: "potential", files: eligible, query }, job.current.signal));
       const q = query.toLowerCase();
       const capturedHeaders = (project.sessions || []).flatMap((session) =>
         (session.requests || []).flatMap((request) =>
@@ -96,19 +113,37 @@ export function ResearchView({ project, selection, update, navigate }: {
       }
       update((current) => {
         if (current.id !== draftContext.projectId || drafts.some((draft) => !current.files.some((file) => file.id === draft.file.id && file.bytes === draft.file.bytes))) throw new Error("Source evidence changed. Generate a fresh preview.");
-        if (current.files.length + derivatives.length > 1000 || current.files.reduce((sum, file) => sum + file.bytes.length, 0) + derivatives.reduce((sum, file) => sum + file.bytes.length, 0) > PROJECT_LIMIT) throw new Error("Derived files exceed the project evidence budget.");
+        if (current.files.length + derivatives.length > 1000 || current.files.reduce((sum, file) => sum + evidenceSize(file), 0) + derivatives.reduce((sum, file) => sum + evidenceSize(file), 0) > PROJECT_LIMIT) throw new Error("Derived files exceed the project evidence budget.");
         return { ...current, files: [...current.files, ...derivatives], transformations: [...(current.transformations || []), ...lineage] };
       });
       clearDraft(); setMessage(`Saved ${derivatives.length} derived files with original hashes and transformation history.`);
     } catch (error) { setError(String(error)); } finally { setBusy(false); }
   }
-  const contracts = tab === "API shapes" ? observedContracts(project) : [];
+  const [contracts, setContracts] = useState<ReturnType<typeof observedContracts>>([]);
+  useEffect(() => {
+    if (tab !== "API shapes") return;
+    let active = true; const controller = new AbortController();
+    const load = async () => {
+      const files: Evidence[] = []; let budget = 0;
+      for (const file of project.files) {
+        if (evidenceSize(file) > 1024 * 1024 || budget + evidenceSize(file) > 16 * 1024 * 1024) continue;
+        files.push(await materializeEvidence(file)); budget += evidenceSize(file);
+      }
+      let remaining = 5000;
+      const sessions = (project.sessions || []).map(session => { const requests = (session.requests || []).slice(0, remaining); remaining -= requests.length; return { ...session, observations: [], requests }; });
+      const result = await runResearchJob<ReturnType<typeof observedContracts>>({ action: "contracts", files, sessions }, controller.signal);
+      if (active) setContracts(result);
+    };
+    void load().catch(cause => { if (active) setError(String(cause)); });
+    return () => { active = false; controller.abort(); };
+  }, [tab, project.files]);
   return <section className="research-workspace" aria-labelledby="research-title">
     <h1 id="research-title">Investigation tools</h1>
     <p>Transform a copy of code, follow references, and describe observed API behavior.</p>
     <div className="research-tabs" role="group" aria-label="Investigation tools">
       {["Transforms", "Cross-references", "API shapes", "State snapshots"].map((name) => <button key={name} aria-pressed={tab === name} onClick={() => setTab(name)}>{name}</button>)}
     </div>
+    {busy && <button onClick={() => job.current.abort()}>Cancel operation</button>}
     {error && <p role="alert" className="alert">{error}</p>}
     {message && <p role="status">{message}</p>}
     {tab === "Transforms" && <>
@@ -119,7 +154,7 @@ export function ResearchView({ project, selection, update, navigate }: {
         <button disabled={busy || !files.length} onClick={() => void preview()} title={!files.length ? "Import JavaScript evidence first." : "Parse and preview changes without executing sample code."}>Preview transformations</button>
         <button disabled={busy || !drafts.some((draft) => draft.preview.changes)} onClick={() => void save()} title="Save new derivative evidence with provenance. Originals are preserved.">Save derived files</button>
       </div>
-      <p className="panel-help">These conservative AST recipes do not execute samples or promise to undo arbitrary obfuscation. Removing debugger statements changes behavior; review the proposed copy before using it in a VM.</p>
+      <p className="panel-help">These conservative AST recipes do not execute samples or promise to undo arbitrary obfuscation. Removing debugger statements changes behavior; review the proposed copy before saving derived evidence.</p>
       {drafts.map((draft) => <details className="research-preview" key={draft.file.id} open><summary>{draft.file.name} — {draft.preview.changes} changes</summary>{draft.preview.diagnostics.map((diagnostic) => <p key={diagnostic}>{diagnostic}</p>)}<div className="research-diff"><div><h2>Original</h2><pre>{decodeText(draft.file.bytes)}</pre></div><div><h2>Proposed derivative</h2><pre>{draft.preview.source}</pre></div></div></details>)}
       <h2>Transformation history</h2>
       {project.files.filter((file) => file.derivation).map((file) => <article className="research-record" key={file.id}><strong>{file.name}</strong><p>{file.derivation!.recipe} · {file.derivation!.changes} changes · {file.derivation!.createdAt}</p><p>Original SHA-256: <code>{file.derivation!.sourceHash}</code></p><button onClick={() => navigate({ fileId: file.id, start: 0, end: 0 })}>Inspect derivative</button>{file.derivation!.sourceId && <button onClick={() => navigate({ fileId: file.derivation!.sourceId!, start: 0, end: 0 })}>Inspect original</button>}</article>)}
@@ -140,12 +175,12 @@ export function ResearchView({ project, selection, update, navigate }: {
     </>}
     {tab === "API shapes" && <>
       <p>Response shapes are inferred from retained JSON bodies. Counts show observed samples; they do not establish required fields or reveal server source code. Query values and response values are omitted from this summary.</p>
-      {!contracts.length && <p>Import a HAR capture or capture website requests in Debug to begin.</p>}
+      {!contracts.length && <p>Import a HAR capture or saved observations to begin.</p>}
       {contracts.map((contract) => <details className="research-preview" key={contract.endpoint}><summary>{contract.endpoint} — {contract.samples} samples</summary><p>Status codes: {contract.statuses.join(", ") || "unavailable"}. {contract.incomplete ? "Coverage is incomplete or bounded." : "Retained response coverage available."}</p><ul>{contract.fields.map((field) => <li key={field.path}><code>{field.path}</code>: {field.types.join(" / ")} · observed in {field.samples} samples</li>)}</ul>{contract.evidenceIds.map((id) => <button key={id} onClick={() => navigate({ fileId: id, start: 0, end: 0 })}>Inspect supporting response {id.slice(0, 8)}</button>)}</details>)}
     </>}
     {tab === "State snapshots" && <>
-      <p>Capture state in Debug, then compare recorded heap usage and shallow scope values. Matching uses scope names and positions; descriptions do not establish object identity. Snapshots cannot restore execution or active connections.</p>
-      <div className="research-controls">{(["Before", "After"] as const).map((label) => <label key={label}>{label}<select aria-label={`${label} state snapshot`} value={label === "Before" ? beforeId : afterId} onChange={(event) => { (label === "Before" ? setBeforeId : setAfterId)(event.target.value); setDifferences(undefined); }}><option value="">Choose a snapshot</option>{project.files.filter((file) => file.captureKind === "snapshot").map((file) => <option key={file.id} value={file.id}>{file.name}</option>)}</select></label>)}<button disabled={!beforeId || !afterId || beforeId === afterId} title="Choose two different retained state snapshots." onClick={() => { try { const before = project.files.find((file) => file.id === beforeId), after = project.files.find((file) => file.id === afterId); if (!before || !after) throw new Error("Selected snapshot evidence is no longer available."); setDifferences(snapshotDifferences(before, after)); setError(""); } catch (error) { setError(String(error)); } }}>Compare state snapshots</button></div>
+      <p>Compare imported snapshots of recorded heap usage and shallow scope values. Matching uses scope names and positions; descriptions do not establish object identity. Snapshots cannot restore execution or active connections.</p>
+      <div className="research-controls">{(["Before", "After"] as const).map((label) => <label key={label}>{label}<select aria-label={`${label} state snapshot`} value={label === "Before" ? beforeId : afterId} onChange={(event) => { (label === "Before" ? setBeforeId : setAfterId)(event.target.value); setDifferences(undefined); }}><option value="">Choose a snapshot</option>{project.files.filter((file) => file.captureKind === "snapshot").map((file) => <option key={file.id} value={file.id}>{file.name}</option>)}</select></label>)}<button disabled={!beforeId || !afterId || beforeId === afterId} title="Choose two different retained state snapshots." onClick={async () => { try { const before = project.files.find((file) => file.id === beforeId), after = project.files.find((file) => file.id === afterId); if (!before || !after) throw new Error("Selected snapshot evidence is no longer available."); setDifferences(await runResearchJob<ReturnType<typeof snapshotDifferences>>({ action: "snapshots", files: [await materializeEvidence(before), await materializeEvidence(after)] })); setError(""); } catch (error) { setError(String(error)); } }}>Compare state snapshots</button></div>
       {differences && <p role="status">{differences.length} differences shown, capped at 1,000.</p>}
       {differences?.map((difference) => <article className="research-record" key={difference.path}><strong>{difference.path}</strong><p>Before: <code>{difference.before ?? "not captured"}</code></p><p>After: <code>{difference.after ?? "not captured"}</code></p></article>)}
       {[beforeId, afterId].filter((id, index, list) => id && list.indexOf(id) === index && project.files.some((file) => file.id === id)).map((id) => <button key={id} onClick={() => navigate({ fileId: id, start: 0, end: 0 })}>Inspect snapshot evidence</button>)}

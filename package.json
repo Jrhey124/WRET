@@ -1,13 +1,8 @@
 {
   "name": "whidra",
   "version": "1.0.0",
-  "description": "Whidra: a unified browser-based reverse engineering suite for inspecting web code, tracing behavior, and debugging.",
+  "description": "Whidra: Web-based Reverse Engineering Tool for static analysis and imported capture inspection.",
   "scripts": {
-    "companion:build": "node scripts/build-companion.mjs",
-    "companion": "npm run build && npm run companion:build && node dist-companion/server.mjs",
-    "companion:check": "tsc --noEmit --project companion/tsconfig.json",
-    "test:vm": "npm run build && npm run companion:build && playwright test --config playwright.vm.config.ts",
-    "test:guest": "docker build -f guest/Dockerfile.integration -t wret-guest-integration . && node scripts/test-guest.mjs",
     "tools:build": "node scripts/build-tools.mjs",
     "dev": "npm run tools:build && vite",
     "build": "npm run tools:build && tsc --noEmit && vite build",
@@ -38,8 +33,7 @@
     "prettier": "3.9.9",
     "react": "19.3.0",
     "react-dom": "19.3.0",
-    "wabt": "1.0.39",
-    "ws": "8.22.0"
+    "wabt": "1.0.39"
   },
   "devDependencies": {
     "@playwright/test": "1.63.0",
@@ -47,7 +41,6 @@
     "@types/node": "26.6.4",
     "@types/react": "19.3.0",
     "@types/react-dom": "19.3.0",
-    "@types/ws": "8.18.2",
     "@vitejs/plugin-react": "6.1.1",
     "esbuild": "0.28.2",
     "fake-indexeddb": "6.2.5",

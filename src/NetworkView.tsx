@@ -1,4 +1,5 @@
-import { useMemo, useState } from "react";
+import { materializeEvidence } from "./storage";
+import { useEffect, useMemo, useState } from "react";
 import type { CapturedRequest, DebugSession } from "./debug-types";
 import { decodeText, type Evidence } from "./model";
 
@@ -44,7 +45,7 @@ export function NetworkView({
         <div>
           <div className="section-kicker">CAPTURED WEBSITE ACTIVITY</div>
           <h1 id="network-title">Network</h1>
-          <p>Requests and response resources captured in local VM sessions or imported from HAR files.</p>
+          <p>Imported requests and response resources. These are recorded observations, not new execution.</p>
         </div>
         <button onClick={onImportHar} title="Import a HAR file offline. Recorded URLs are never contacted during import.">Import HAR</button>
       </header>
@@ -72,7 +73,7 @@ export function NetworkView({
               ))}
             </tbody>
           </table>
-          {!entries.length && <div className="network-empty"><h2>No captured requests</h2><p>Start a URL investigation in Debug, or import a HAR capture for offline review.</p><button onClick={onImportHar}>Import HAR</button></div>}
+          {!entries.length && <div className="network-empty"><h2>No captured requests</h2><p>Import a HAR capture or a saved project for offline review.</p><button onClick={onImportHar}>Import HAR</button></div>}
           {!!entries.length && !filtered.length && <p className="network-empty-small">No requests match these filters.</p>}
         </div>
         {activeEntry && <aside className="network-details" aria-label="Selected request details">
@@ -122,7 +123,13 @@ function HeaderList({ headers }: { headers?: { name: string; value: string }[] }
 
 function ResponseBody({ evidence, mimeType, onOpen }: { evidence?: Evidence; mimeType?: string; onOpen: () => void }) {
   const [view, setView] = useState<"Auto" | "Text" | "JSON" | "Hex">("Auto");
+  const [loaded, setLoaded] = useState<Evidence>();
+  const [error, setError] = useState("");
+  useEffect(() => { let active = true; setLoaded(undefined); setError(""); if (evidence) materializeEvidence(evidence).then(file => { if (active) setLoaded(file); }).catch(cause => { if (active) setError(String(cause)); }); return () => { active = false; }; }, [evidence]);
   if (!evidence) return <p>No response body was retained for this request.</p>;
+  if (error) return <p role="alert">{error}</p>;
+  if (!loaded) return <p role="status">Loading retained response?</p>;
+  evidence = loaded;
   const body = decodeText(evidence.bytes);
   let json: string | undefined;
   try { json = JSON.stringify(JSON.parse(body), null, 2); } catch { /* the JSON view stays unavailable */ }

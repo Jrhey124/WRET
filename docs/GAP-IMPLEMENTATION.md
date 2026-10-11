@@ -1,14 +1,6 @@
-# Whidra web investigation: gaps and implementation
+# Whidra static investigation capabilities
 
-Whidra investigates browser-visible code and behavior. A browser heap is inspectable through CDP, but a heap snapshot is not a restorable execution checkpoint. Binary clients can also depend on private servers; possessing a client does not imply possessing all server logic. The implementation distinguishes observations, static resolution, and unresolved relationships.
-
-## 1. Execution state
-
-Implemented: capability-gated Debug controls capture heap usage and shallow own properties from the selected paused frame's scopes. Accessors are recorded without invoking getters. Snapshots become JSON evidence and can be compared in Research. Live editing is probed with a benign compiled script before sample navigation. Current Chromium has removed CDP live editing, so Whidra disables it with an explanation. Older compatible builds can expose the reviewed draft/dry-run/apply adapter; applied source is retained with original provenance. Transformed derivatives can be executed in a fresh session, which does not preserve volatile runtime state.
-
-Bounds: 12 scopes, 200 properties per scope, 300 characters per primitive string or description, 1 MiB per evidence capture, existing session/project budgets. Comparison shows at most 1,000 differences and uses scope name/position, not heap object identity. All captures remain observations: closures, object graphs, timers, sockets, DOM, and execution state are not restored.
-
-Follow-up: bounded heap-profiler sampling, explicit object-graph exploration, application-specific state serialization with opt-in restore, and deterministic replay fixtures. Full arbitrary heap restoration is not a promised feature.
+Whidra analyzes browser-visible code and imported observations without executing samples. Static resolution, observed behavior, and unresolved relationships are distinct.
 
 ## 2. AST workflows
 
@@ -24,13 +16,7 @@ Implemented: Research groups captured requests by method and endpoint and descri
 
 Bounds: 5,000 requests, 1,000 endpoint groups, 8 MiB of inspected bodies, 200 field paths per response/group, depth 6, 2,000 visited values per body, 20 array elements, 100 keys per object.
 
-Follow-up: capture comparison, endpoint state-transition hypotheses, schema export with confidence labels, and explicitly reviewed replay through the existing broker. Backend source recovery is outside this workflow.
-
-## 4. Repeated debugger pauses
-
-Implemented: Debug can suppress all pauses through CDP and restore normal pauses. The UI states that line breakpoints and exception pauses are suppressed too. The policy applies to attached targets and new targets, and changes appear in observations. A separate AST recipe removes debugger statements from a reviewed derivative.
-
-Follow-up: per-source ignore lists and response overrides for locally authorized fixtures. No automatic challenge solving, timing spoofing, or guarantee of bypassing commercial protection is provided. Pause suppression is a debugging control, not a browser stealth mode.
+Follow-up: capture comparison, endpoint state-transition hypotheses, schema export with confidence labels, and explicit comparison of imported captures. Backend source recovery is outside this workflow.
 
 ## 5. Cross-references
 
@@ -38,20 +24,14 @@ Implemented: a searchable workspace index separates reads, writes, and read/writ
 
 Bounds: 1 MiB/file, 16 MiB total source indexing, 5,000 references. Re-exports, namespace property resolution, dynamic imports, package resolution, and framework state models remain follow-up work.
 
-## 6. WebAssembly investigation
+## WebAssembly
 
-Implemented: WABT section/import/export/WAT inspection now has a bounded WebAssembly 1.0 instruction index with original byte ranges, direct-call targets, partial-coverage diagnostics, and a virtualized searchable view. Analysts can assign module-hash/function-index aliases; aliases appear in the Wasm function list, WAT where WABT exposes a stable name, graph, and reports. Aliases are project data and do not change module bytes. Schema 5 imports schemas 1–4 and preserves aliases through export/reopen. The VM can explicitly capture complete Wasm script bytecode up to the 25 MiB evidence limit through Chromium’s `Debugger.getScriptSource` capability; the existing network body path remains capped at 1 MiB.
+WABT disassembly, sections/imports/exports, original-byte instruction navigation, direct-call references, virtualized function/instruction views, and module-hash/function-index aliases remain available. Unknown proposal instructions retain partial-coverage diagnostics. Imported Wasm is never instantiated. Historical bridge and memory observations can be reviewed, but live monitoring, memory capture, and VM controls have been removed.
 
-Implemented with limits: optional pre-execution wrappers observe calls through supported `WebAssembly.instantiate`, `instantiateStreaming`, and `Instance` paths, including arguments, return values, traps, nesting, and target identity. Analyst-selected UTF-8 pointer/length or bounded NUL-terminated decoders can read at most 4 KiB from an explicitly selected imported/exported memory; memory is reacquired for each decode to account for growth. Instrumentation can affect identity/timing, calls inside Wasm and direct access paths are missed, page code can forge events through the exposed binding, and module/function identity is not cryptographically linked to every event.
+## Saved observations
 
-Follow-up: runtime linear-memory range snapshots and visual maps, CFG construction/simplification, source/module relationship resolution, broader loader/runtime coverage, and a separate authenticated collaboration relay. None are represented as complete capabilities yet.
+Imported heap/scope snapshots remain JSON evidence and can be compared in Research. Saved observations provides a searchable read-only record list; Network reviews imported requests. Snapshots do not restore execution state.
 
-## Accessibility and release checks
+## Validation
 
-Research and runtime controls use labeled fields, visible keyboard focus, explanatory disabled-action help, selectable source previews, and searchable reference lists. Status changes use polite announcements. Reduced-motion preferences disable transitions. The existing Ctrl+K palette exposes Research and preserves editing shortcuts.
-
-Required validation: typecheck, companion typecheck, unit tests for semantic hazards/bounds/provenance, Chromium and Edge flows for previews/navigation/export/reopen, and real guest tests for snapshots, Wasm bridge/module capture, capability negotiation, and pause-policy reset. The guest suite explicitly verifies live-edit rejection on unsupported builds, or dry-run/apply on compatible builds. Old guest images do not advertise new capabilities and leave runtime controls disabled. Rebuild the prepared guest image using the current agent; its integrity manifest must match.
-
-Windows/QEMU lifecycle, Narrator/NVDA, and actual guest acceptance remain release gates. A static/browser test pass is not evidence that live edit works with every Chromium build.
-
-Official implementation references: [CDP Debugger](https://chromedevtools.github.io/devtools-protocol/tot/Debugger/), [CDP Runtime](https://chromedevtools.github.io/devtools-protocol/tot/Runtime/), [CDP HeapProfiler](https://chromedevtools.github.io/devtools-protocol/tot/HeapProfiler/).
+Run frontend typecheck, build, unit checks, and Chromium/Edge workflows. Verify static-preview isolation, legacy archive preservation, cancellation, bounded transfers, lazy storage, aliases, and transformation provenance.

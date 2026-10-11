@@ -1,6 +1,6 @@
 import { test, expect } from "@playwright/test";
 
-test("beautifies without altering original evidence, safely renders local HTML, and hands off to Debug", async ({ page }) => {
+test("beautifies without altering original evidence, safely renders local HTML", async ({ page }) => {
   const externalRequests: string[] = [];
   page.on("request", (request) => { if (request.url().includes("evil.invalid")) externalRequests.push(request.url()); });
   await page.goto("/");
@@ -28,10 +28,5 @@ test("beautifies without altering original evidence, safely renders local HTML, 
   expect(html).not.toContain("<script"); expect(html).not.toContain("onload="); expect(html).not.toContain("evil.invalid");
   expect(html).toContain("data:image/png;base64,"); expect(html).toContain("color:red");
   expect(externalRequests).toEqual([]);
-  await page.getByRole("button", { name: "Interactive preview in VM" }).click();
-  await expect(page.getByRole("combobox", { name: "Debug entrypoint" })).toHaveValue("site/index.html");
-  await page.getByText(/Evidence sent to the VM/).click();
-  await expect(page.getByRole("checkbox", { name: "site/index.html" })).toBeChecked();
-  await expect(page.getByRole("checkbox", { name: "site/css/main.css" })).toBeChecked();
-  await expect(page.getByRole("button", { name: "Start session", exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Interactive preview in VM" })).toHaveCount(0);
 });

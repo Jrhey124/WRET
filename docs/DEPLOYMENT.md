@@ -1,6 +1,6 @@
 # Whidra Docker deployment
 
-This image provides static inspection. Dynamic debugging runs through `npm.cmd run companion` on Windows with QEMU and a prepared guest, documented in [Companion setup](COMPANION.md). The companion binds its UI and authenticated API to the same loopback origin and does not require a hosted account or database.
+This image serves Whidra as a static application. Evidence analysis runs in the visiting browser; the server does not run samples or virtual machines. A Raspberry Pi can host nginx without QEMU, KVM, or a companion service.
 
 ## Local workstation
 

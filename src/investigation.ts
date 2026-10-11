@@ -1,3 +1,4 @@
+import { evidenceSize } from "./model";
 import { parse } from "acorn";
 import { simple } from "acorn-walk";
 import { parse as parseHTML } from "parse5";
@@ -113,7 +114,7 @@ export function embeddedSources(files: Evidence[]): Evidence[] {
         if (
           bytes.length > 25 * 1024 * 1024 ||
           files.length + added.length >= 1000 ||
-          [...files, ...added].reduce((n, f) => n + f.bytes.length, 0) +
+          [...files, ...added].reduce((n, f) => n + evidenceSize(f), 0) +
             bytes.length >
             100 * 1024 * 1024
         )

@@ -1,4 +1,6 @@
 import {
+  evidenceSize,
+  type Evidence,
   FILE_LIMIT,
   PROJECT_LIMIT,
   DERIVED_STORAGE_LIMIT,
@@ -64,7 +66,7 @@ function database(): Promise<IDBDatabase> {
       );
   });
 }
-export async function loadProject(): Promise<Project | undefined> {
+export async function loadProject(lazy = false): Promise<Project | undefined> {
   const db = await database();
   try {
     return await new Promise((resolve, reject) => {
@@ -77,23 +79,24 @@ export async function loadProject(): Promise<Project | undefined> {
         if (record?.storageVersion === 2) {
           const tx = db.transaction(["evidence", "contentChunks", "analysisResults", "projectRecords", "transformations", "annotations", "runtimeRecords"], "readonly");
           const projectId = record.projectId;
+          const projectRange = IDBKeyRange.bound([projectId], [projectId, []]);
           const evidenceReq = tx.objectStore("evidence").index("byProject").getAll(projectId);
-          const chunksReq = tx.objectStore("contentChunks").getAll();
-          const analysisReq = tx.objectStore("analysisResults").getAll();
+          const chunksReq = lazy ? undefined : tx.objectStore("contentChunks").getAll(projectRange);
+          const analysisReq = tx.objectStore("analysisResults").getAll(projectRange);
           const recordsReq = tx.objectStore("projectRecords").get(projectId);
-          const transformationsReq = tx.objectStore("transformations").getAll();
+          const transformationsReq = tx.objectStore("transformations").getAll(projectRange);
           const annotationsReq = tx.objectStore("annotations").get(projectId);
           const runtimeReq = tx.objectStore("runtimeRecords").get(projectId);
           tx.oncomplete = () => {
-            const chunks = chunksReq.result.filter((x: any) => x.projectId === projectId);
+            const chunks = (chunksReq?.result || []).filter((x: any) => x.projectId === projectId);
             const analyses = new Map(analysisReq.result.filter((x: any) => x.projectId === projectId).map((x: any) => [x.fileId, x.result]));
             const files = evidenceReq.result.map((recordValue: any) => {
-              const { projectId: _projectId, byteLength, contentHash: _contentHash, ...meta } = recordValue;
+              const { projectId: _projectId, byteLength, contentStored: _contentStored, contentHash: _contentHash, ...meta } = recordValue;
               const pieces = chunks.filter((x: any) => x.fileId === meta.id).sort((a: any, b: any) => a.index - b.index);
-              const bytes = new Uint8Array(byteLength);
+              const bytes = new Uint8Array(lazy ? 0 : byteLength);
               let offset = 0;
               for (const piece of pieces) { bytes.set(piece.bytes, offset); offset += piece.bytes.length; }
-              return { ...meta, bytes, result: analyses.get(meta.id) };
+              return { ...meta, bytes, ...(lazy ? { byteLength, contentStored: true, hash: meta.hash || _contentHash } : {}), result: analyses.get(meta.id) };
             });
             const { projectId: _storedProjectId, ...projectRecord } = recordsReq.result;
             const value = { ...projectRecord.project, files, ...(annotationsReq.result ? { notes: annotationsReq.result.notes, decodes: annotationsReq.result.decodes } : { notes: [], decodes: [] }), ...(runtimeReq.result ? { sessions: runtimeReq.result.sessions, breakpoints: runtimeReq.result.breakpoints } : { sessions: [], breakpoints: [] }), transformations: transformationsReq.result.filter((x: any) => x.projectId === projectId).map((x: any) => x.value) };
@@ -247,8 +250,10 @@ export async function saveProject(project: Project): Promise<void> {
             const { bytes, result, ...metadata } = file;
             const contentHash = hashes.get(file.id)!;
             const before = previous.get(file.id);
-            const sameContent = before?.contentHash === contentHash && before?.byteLength === bytes.length;
-            evidenceStore.put({ ...metadata, projectId, byteLength: bytes.length, contentHash });
+            const length = evidenceSize(file);
+            const sameContent = before?.contentHash === contentHash && before?.byteLength === length;
+            if (bytes.length !== length && !sameContent) throw new Error("Stored evidence changed before save; reload or export before retrying.");
+            evidenceStore.put({ ...metadata, projectId, byteLength: length, contentHash });
             if (!sameContent) {
               changed.add(file.id);
               invalidatedEvidence.add(file.id);
@@ -267,7 +272,7 @@ export async function saveProject(project: Project): Promise<void> {
               const [chunkProject, fileId, index] = cursor.primaryKey as IDBValidKey[];
               if (chunkProject === projectId) {
                 const file = project.files.find((candidate) => candidate.id === fileId);
-                const expectedChunks = file ? Math.ceil(file.bytes.length / CONTENT_CHUNK_SIZE) : 0;
+                const expectedChunks = file ? Math.ceil(evidenceSize(file) / CONTENT_CHUNK_SIZE) : 0;
                 if (!file || changed.has(String(fileId)) && Number(index) >= expectedChunks)
                   chunksStore.delete(cursor.primaryKey);
               }
@@ -333,13 +338,12 @@ export function fromBase64(value: string): Uint8Array {
 }
 export async function exportProject(project: Project): Promise<string> {
   validateProjectBudgets(project);
-  const files = await Promise.all(
-    project.files.map(async (file) => ({
-      ...file,
-      bytes: toBase64(file.bytes),
-      evidenceHash: await sha256(file.bytes),
-    })),
-  );
+  const files = [];
+  for (const metadata of project.files) {
+    const file = await materializeEvidence(metadata);
+    const { byteLength: _length, contentStored: _stored, ...portable } = file;
+    files.push({ ...portable, bytes: toBase64(file.bytes), evidenceHash: await sha256(file.bytes) });
+  }
   return JSON.stringify({
     ...project,
     schema: 5,
@@ -425,6 +429,7 @@ export async function importProject(content: string): Promise<Project> {
       fail("runtime source URL");
     if (file.captureKind !== undefined && !["snapshot", "script", "response", "live-edit"].includes(file.captureKind)) fail("capture kind");
     file.bytes = fromBase64(file.bytes);
+    delete file.byteLength; delete file.contentStored;
     evidencePath(file.name);
     total += file.bytes.length;
     if (file.bytes.length > FILE_LIMIT || total > PROJECT_LIMIT)
@@ -688,7 +693,7 @@ export function report(project: Project): string {
     "",
     "## Evidence",
     ...project.files.flatMap((f) => [
-      `- **${escapeMarkdown(f.name)}** · ${f.bytes.length} bytes · ${f.format}`,
+      `- **${escapeMarkdown(f.name)}** · ${evidenceSize(f)} bytes · ${f.format}`,
       `  - SHA-256: ${f.hash || f.result?.hash || "Not analyzed; integrity hash is included in project archive"}`,
       ...(f.derivation ? [`  - Transformation: ${escapeMarkdown(f.derivation.recipe)}; ${f.derivation.changes} changes; original SHA-256 ${f.derivation.sourceHash}; ${escapeMarkdown(f.derivation.createdAt)}`] : []),
       ...(f.result?.diagnostics || []).map(
@@ -746,4 +751,12 @@ export function report(project: Project): string {
     "Original evidence remains in this portable Whidra archive. Formatted and decoded views do not replace original bytes.",
     "",
   ].join("\n");
+}
+
+export async function materializeEvidence(file: Evidence): Promise<Evidence> {
+  if (file.bytes.length === evidenceSize(file)) return file;
+  if (!file.contentStored) throw new Error("Evidence content is unavailable");
+  const bytes = await readEvidenceRange(file.id, 0, evidenceSize(file));
+  if (file.hash && await sha256(bytes) !== file.hash) throw new Error("Stored evidence hash mismatch");
+  return { ...file, bytes };
 }

@@ -63,6 +63,9 @@ export interface Evidence {
   name: string;
   format: Format;
   bytes: Uint8Array;
+  /** Local repository metadata, omitted from portable archives. */
+  byteLength?: number;
+  contentStored?: boolean;
   hash?: string;
   runtimeUrl?: string;
   sourceMapOf?: string;
@@ -292,3 +295,5 @@ function sha256Fallback(input: Uint8Array): string {
   }
   return h.map((value) => value.toString(16).padStart(8, "0")).join("");
 }
+
+export function evidenceSize(file: Evidence): number { return file.byteLength ?? file.bytes.length; }

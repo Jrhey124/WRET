@@ -1,3 +1,7 @@
+import { searchEvidence } from "./search-runtime";
+import { evidenceSize } from "./model";
+import { readEvidenceRange, materializeEvidence } from "./storage";
+import { acquireWorker } from "./worker-queue";
 import {
   lazy,
   Suspense,
@@ -36,17 +40,15 @@ import {
   type Note,
   type Project,
 } from "./model";
-import SearchWorker from "./search.worker?worker";
-import { DebugPanel } from "./DebugPanel";
+import { SavedObservations } from "./SavedObservations";
 import { NetworkView } from "./NetworkView";
 import { ResearchView } from "./ResearchView";
 import { StaticRenderView } from "./StaticRenderView";
-import { buildStaticPreview } from "./static-render";
 import whidraLogoUrl from "./assets/whidra-hydra-gear.png";
 import packageJson from "../package.json";
 import { WasmView } from "./WasmView";
 import BeautifyWorker from "./analysis.worker?worker";
-import { parseHar } from "./har";
+import { HAR_LIMIT, type HarImport } from "./har";
 import {
   dependencies,
   sourceMappings,
@@ -98,11 +100,7 @@ function download(name: string, content: string, type: string) {
 function validText(file: Evidence) {
   try {
     const decoder = new TextDecoder("utf-8", { fatal: true });
-    if (file.bytes.length > 2 * 1024 * 1024) {
-      for (let offset = 0; offset < file.bytes.length; offset += 256 * 1024)
-        decoder.decode(file.bytes.subarray(offset, Math.min(file.bytes.length, offset + 256 * 1024)), { stream: true });
-      decoder.decode();
-    } else decoder.decode(file.bytes);
+    decoder.decode(file.bytes.subarray(0, 2 * 1024 * 1024), { stream: evidenceSize(file) > 2 * 1024 * 1024 });
     return file.format !== "wasm" && file.format !== "binary";
   } catch {
     return false;
@@ -110,7 +108,7 @@ function validText(file: Evidence) {
 }
 
 export function App() {
-  const [mode, setMode] = useState<"Overview" | "Inspect" | "Network" | "Research" | "Debug" | "Report">(
+  const [mode, setMode] = useState<"Overview" | "Inspect" | "Network" | "Observations" | "Research" | "Report">(
     "Overview",
   );
   const [palette, setPalette] = useState(false);
@@ -142,10 +140,11 @@ export function App() {
   const [toolStatusMessage, setToolStatusMessage] = useState("");
   const [beautified, setBeautified] = useState<Record<string, string>>({});
   const [beautifying, setBeautifying] = useState(false);
+  const beautifyRelease = useRef<(() => void) | undefined>(undefined);
+  const beautifyAbort = useRef<AbortController | undefined>(undefined);
   const beautifyWorker = useRef<Worker | undefined>(undefined);
   const beautifyTimeout = useRef<number | undefined>(undefined);
-  useEffect(() => () => { beautifyWorker.current?.terminate(); if (beautifyTimeout.current) clearTimeout(beautifyTimeout.current); }, []);
-  const [debugHandoff, setDebugHandoff] = useState<{ entry: string; files: string[] }>();
+  useEffect(() => () => { beautifyAbort.current?.abort(); beautifyRelease.current?.(); beautifyWorker.current?.terminate(); if (beautifyTimeout.current) clearTimeout(beautifyTimeout.current); }, []);
   const [storageError, setStorageError] = useState(""),
     [persistent, setPersistent] = useState(false);
   const [restoreFailed, setRestoreFailed] = useState(false);
@@ -190,6 +189,33 @@ export function App() {
     checkpointPending = useRef(false),
     pendingWrites = useRef(0);
   const file = project.files.find((f) => f.id === selected);
+  useEffect(() => {
+    if (!file?.contentStored || file.bytes.length === evidenceSize(file) || evidenceSize(file) > 2 * 1024 * 1024) return;
+    let active = true;
+    const loadSelection = async () => {
+      const loaded = await materializeEvidence(file);
+      const maps: Evidence[] = []; let budget = evidenceSize(file);
+      for (const map of project.files) {
+        if (map.id === file.id || map.format !== "sourcemap" || evidenceSize(map) > 2 * 1024 * 1024 || budget + evidenceSize(map) > 32 * 1024 * 1024) continue;
+        maps.push(await materializeEvidence(map)); budget += evidenceSize(map);
+      }
+      return { loaded, maps };
+    };
+    loadSelection().then(({ loaded, maps }) => {
+      if (!active) return;
+      setProject(previous => ({ ...previous, files: previous.files.map(candidate => candidate.id === loaded.id ? loaded : maps.find(map => map.id === candidate.id) || (candidate.contentStored ? { ...candidate, bytes: new Uint8Array() } : candidate)) }));
+    }).catch(cause => { if (active) setError(String(cause)); });
+    return () => { active = false; };
+  }, [file?.id, file?.hash, file?.bytes.length]);
+  const [hexBytes, setHexBytes] = useState<Uint8Array>(new Uint8Array());
+  useEffect(() => {
+    if (!file || view !== "Hex") return;
+    let active = true; setHexBytes(new Uint8Array());
+    const start = hexPage * 512, end = Math.min(evidenceSize(file), start + 512);
+    const load = file.bytes.length === evidenceSize(file) ? Promise.resolve(file.bytes.slice(start, end)) : readEvidenceRange(file.id, start, end);
+    load.then(bytes => { if (active) setHexBytes(bytes); }).catch(cause => { if (active) setError(String(cause)); });
+    return () => { active = false; };
+  }, [file?.id, file?.bytes, hexPage, view]);
   const result = file?.result;
   let displayedWat = result?.wat;
   if (displayedWat && result?.wasmFunctions) {
@@ -209,7 +235,7 @@ export function App() {
         : { mappings: [], diagnostics: [] },
     [project.files, file],
   );
-  const totalBytes = project.files.reduce((sum, f) => sum + f.bytes.length, 0);
+  const totalBytes = project.files.reduce((sum, f) => sum + evidenceSize(f), 0);
   const findings = project.files.reduce(
     (sum, f) => sum + (f.result?.findings.length || 0),
     0,
@@ -271,7 +297,7 @@ export function App() {
   }, [palette]);
   useEffect(() => {
     let alive = true;
-    loadProject()
+    loadProject(true)
       .then((p) => {
         if (!alive) return;
         if (p) {
@@ -319,6 +345,15 @@ export function App() {
           savedRevision.current = rev;
           if (revision.current === rev) {
             setStorageError("");
+            if (snapshot.files.some(file => !file.contentStored)) setProject(previous => {
+              let retained = 0;
+              return { ...previous, files: previous.files.map(file => {
+                const stored = snapshot.files.find(item => item.id === file.id && item.bytes === file.bytes);
+                if (!stored) return file;
+                const length = evidenceSize(file); retained += length;
+                return { ...file, byteLength: length, contentStored: true, bytes: file.id === selected || retained <= 32 * 1024 * 1024 ? file.bytes : new Uint8Array() };
+              }) };
+            });
           }
         })
         .catch((e) => {
@@ -371,71 +406,25 @@ export function App() {
     setFilter("");
   }, [panel, selected]);
   useEffect(() => {
-    if (!query) {
-      setMatches([]);
-      setSearching(false);
-      return;
-    }
-    setSearching(true);
-    let worker: Worker | undefined;
+    if (!query) { setMatches([]); setSearching(false); return; }
+    const controller = new AbortController(); setSearching(true);
     const timer = setTimeout(() => {
-      worker = new SearchWorker();
-      let resolveAck: (() => void) | undefined;
-      let rejectAck: ((error: Error) => void) | undefined;
-      let resolveDone: ((items: Item[]) => void) | undefined;
-      let rejectDone: ((error: Error) => void) | undefined;
-      let expectedAck: number | undefined;
-      let activeDeadline: ReturnType<typeof setTimeout> | undefined;
-      worker.onmessage = (e) => {
-        if (e.data.type === "ack") {
-          if (e.data.sequence !== expectedAck) { rejectAck?.(new Error("Search worker returned an invalid chunk acknowledgment")); return; }
-          resolveAck?.(); resolveAck = undefined;
-        }
-        else if (e.data.type === "result") { resolveDone?.(e.data.results); resolveDone = undefined; }
-        else if (e.data.type === "error") { const error = new Error(e.data.error); rejectAck?.(error); rejectDone?.(error); rejectAck = undefined; rejectDone = undefined; }
-      };
-      worker.onerror = () => { const error = new Error("Search worker failed"); rejectAck?.(error); rejectDone?.(error); };
       const run = async () => {
         const all: Item[] = [];
         try {
           for (const file of project.files) {
             if (all.length >= 500) break;
-            const jobId = uid();
-            const done = new Promise<Item[]>((resolve, reject) => { resolveDone = resolve; rejectDone = reject; });
-            void done.catch(() => {});
-            activeDeadline = setTimeout(() => { const error = new Error("Search exceeded the 10 second job limit"); rejectAck?.(error); rejectDone?.(error); }, WORKER_TIMEOUT);
-            worker!.postMessage({ type: "start", jobId, query, fileId: file.id, name: file.name });
-            let chunks = 0;
-            for (let offset = 0; offset < file.bytes.length; offset += 256 * 1024) {
-              await new Promise<void>((resolve, reject) => {
-                resolveAck = resolve; expectedAck = chunks;
-                // The per-file deadline also bounds a lost acknowledgment.
-                rejectAck = reject;
-                const bytes = file.bytes.slice(offset, Math.min(file.bytes.length, offset + 256 * 1024));
-                worker!.postMessage({ type: "chunk", jobId, sequence: chunks, offset, bytes }, [bytes.buffer]);
-              });
-              rejectAck = undefined;
-              chunks++;
-            }
-            worker!.postMessage({ type: "finish", jobId, chunks, byteLength: file.bytes.length });
-            all.push(...await done);
-            clearTimeout(activeDeadline); activeDeadline = undefined;
+            all.push(...await searchEvidence(file, query, controller.signal));
+            if (controller.signal.aborted) return;
+            setMatches(all.slice(0, 500));
           }
           if (all.length >= 500) setError("Search reached the 500 result display limit.");
-          setMatches(all.slice(0, 500)); setSearching(false);
-          worker?.terminate();
-        } catch (error) {
-          clearTimeout(activeDeadline);
-          setError(`${String(error)}. Refine the query; completed file results are preserved.`);
-          setMatches(all); setSearching(false); worker?.terminate();
-        }
+        } catch (cause) { if (!controller.signal.aborted) setError(String(cause) + ". Completed file results are preserved."); }
+        finally { if (!controller.signal.aborted) setSearching(false); }
       };
       void run();
     }, 250);
-    return () => {
-      clearTimeout(timer);
-      worker?.terminate();
-    };
+    return () => { clearTimeout(timer); controller.abort(); };
   }, [query, project.files]);
 
   function navigate(loc: Location, item?: Item) {
@@ -461,17 +450,22 @@ export function App() {
     setHexPage(0);
     setWatLine(undefined);
   }
-  function startBeautify() {
-    if (!file || file.bytes.length > 5 * 1024 * 1024 || beautifyWorker.current) return;
+  async function startBeautify() {
+    if (!file || evidenceSize(file) > 5 * 1024 * 1024 || beautifying) return;
     setError(""); setBeautifying(true);
-    const worker = new BeautifyWorker();
+    const controller = new AbortController(); beautifyAbort.current = controller;
+    let target: Evidence;
+    try { target = await materializeEvidence(file); controller.signal.throwIfAborted(); } catch (cause) { setError(String(cause)); setBeautifying(false); return; }
+    try { beautifyRelease.current = await acquireWorker(controller.signal); } catch { setBeautifying(false); return; }
+    let worker: Worker;
+    try { worker = new BeautifyWorker(); } catch (cause) { beautifyRelease.current?.(); beautifyRelease.current = undefined; setBeautifying(false); setError(String(cause)); return; }
     beautifyWorker.current = worker;
     let resolveChunk: (() => void) | undefined;
     let rejectChunk: ((error: Error) => void) | undefined;
     let expectedChunk = -1;
     beautifyTimeout.current = window.setTimeout(() => {
       rejectChunk?.(new Error("Beautify exceeded the 10 second job limit."));
-      worker.terminate(); beautifyWorker.current = undefined; setBeautifying(false);
+      worker.terminate(); beautifyWorker.current = undefined; beautifyRelease.current?.(); beautifyRelease.current = undefined; setBeautifying(false);
       beautifyTimeout.current = undefined;
       setError("Beautifying exceeded the 10 second job limit and was stopped.");
     }, WORKER_TIMEOUT);
@@ -480,40 +474,35 @@ export function App() {
         if (event.data.sequence !== expectedChunk) { rejectChunk?.(new Error("Beautify worker returned an invalid chunk acknowledgment")); return; }
         resolveChunk?.(); resolveChunk = undefined; rejectChunk = undefined; return;
       }
-      if (beautifyTimeout.current) clearTimeout(beautifyTimeout.current); beautifyTimeout.current = undefined; worker.terminate(); beautifyWorker.current = undefined; setBeautifying(false);
-      if (event.data.type === "beautified") { setBeautified((values) => ({ ...values, [file.id]: event.data.formatted })); if (selected === file.id) setView("Beautified"); }
+      if (beautifyTimeout.current) clearTimeout(beautifyTimeout.current); beautifyTimeout.current = undefined; worker.terminate(); beautifyWorker.current = undefined; beautifyRelease.current?.(); beautifyRelease.current = undefined; setBeautifying(false);
+      if (event.data.type === "beautified") { setBeautified({ [file.id]: event.data.formatted }); if (selected === file.id) setView("Beautified"); }
       else setError(String(event.data.error || "Beautify failed."));
     };
-    worker.onerror = () => { rejectChunk?.(new Error("Beautify worker failed")); if (beautifyTimeout.current) clearTimeout(beautifyTimeout.current); beautifyTimeout.current = undefined; worker.terminate(); beautifyWorker.current = undefined; setBeautifying(false); setError("Beautify worker failed. The imported original is unchanged."); };
+    worker.onerror = () => { rejectChunk?.(new Error("Beautify worker failed")); if (beautifyTimeout.current) clearTimeout(beautifyTimeout.current); beautifyTimeout.current = undefined; worker.terminate(); beautifyWorker.current = undefined; beautifyRelease.current?.(); beautifyRelease.current = undefined; setBeautifying(false); setError("Beautify worker failed. The imported original is unchanged."); };
     const send = async () => {
       try {
-        const { bytes: _bytes, result: _result, ...metadata } = file;
-        worker.postMessage({ type: "start", action: "beautify", file: metadata, byteLength: file.bytes.length });
+        const { bytes: _bytes, result: _result, ...metadata } = target;
+        worker.postMessage({ type: "start", action: "beautify", file: metadata, byteLength: target.bytes.length });
         let chunks = 0;
-        for (let offset = 0; offset < file.bytes.length; offset += 256 * 1024) {
+        for (let offset = 0; offset < target.bytes.length; offset += 256 * 1024) {
           await new Promise<void>((resolve, reject) => {
             resolveChunk = resolve; rejectChunk = reject; expectedChunk = chunks;
-            const bytes = file.bytes.slice(offset, Math.min(file.bytes.length, offset + 256 * 1024));
+            const bytes = target.bytes.slice(offset, Math.min(target.bytes.length, offset + 256 * 1024));
             worker.postMessage({ type: "chunk", sequence: chunks, offset, bytes }, [bytes.buffer]);
           });
           chunks++;
         }
-        worker.postMessage({ type: "finish", chunks, byteLength: file.bytes.length });
+        worker.postMessage({ type: "finish", chunks, byteLength: target.bytes.length });
       } catch (error) {
         if (beautifyTimeout.current) clearTimeout(beautifyTimeout.current); beautifyTimeout.current = undefined;
-        worker.terminate(); beautifyWorker.current = undefined; setBeautifying(false); setError(String(error));
+        worker.terminate(); beautifyWorker.current = undefined; beautifyRelease.current?.(); beautifyRelease.current = undefined; setBeautifying(false); setError(String(error));
       }
     };
     void send();
   }
   function cancelBeautify() {
-    if (beautifyTimeout.current) clearTimeout(beautifyTimeout.current); beautifyTimeout.current = undefined; beautifyWorker.current?.terminate(); beautifyWorker.current = undefined; setBeautifying(false);
-  }
-  function startInteractivePreview(targetFile: Evidence) {
-    const related = dependencies(project.files).filter((resource) => resource.file.id === targetFile.id && resource.target).map((resource) => resource.target!.id);
-    try { related.push(...buildStaticPreview(project.files, targetFile).resourceIds); } catch { /* oversized pages can still use explicit VM execution */ }
-    setDebugHandoff({ entry: targetFile.name, files: [...new Set([targetFile.id, ...related])] });
-    setMode("Debug");
+    beautifyAbort.current?.abort();
+    if (beautifyTimeout.current) clearTimeout(beautifyTimeout.current); beautifyTimeout.current = undefined; beautifyWorker.current?.terminate(); beautifyWorker.current = undefined; beautifyRelease.current?.(); beautifyRelease.current = undefined; setBeautifying(false);
   }
   function selectWelcome() {
     setMode("Inspect");
@@ -538,10 +527,7 @@ export function App() {
       if (nextFile) setView(validText(nextFile) ? "Original" : "Hex");
     }
   }
-  const runtimeActive = (project.sessions || []).some((session) =>
-    ["starting", "running", "paused"].includes(session.status),
-  );
-  const canDeleteEvidence = !busy && !runtimeActive;
+  const canDeleteEvidence = !busy;
   function deleteEvidence(evidence: Evidence) {
     if (!canDeleteEvidence) return;
     const linkedNotes = project.notes.filter((note) => note.location.fileId === evidence.id).length;
@@ -615,7 +601,7 @@ export function App() {
       });
       try {
         const output = await runAnalysis(
-          files[i],
+          await materializeEvidence(files[i]),
           activePin,
           (progress) => patchJob(job.id, { progress }),
           controller.signal,
@@ -693,7 +679,7 @@ export function App() {
       if (current.current.files.length + incoming.length > 1000)
         throw new Error("Import rejected: at most 1,000 files per project.");
       if (
-        current.current.files.reduce((n, f) => n + f.bytes.length, 0) +
+        current.current.files.reduce((n, f) => n + evidenceSize(f), 0) +
           incoming.reduce((n, f) => n + f.size, 0) >
         PROJECT_LIMIT
       )
@@ -759,16 +745,6 @@ export function App() {
     }
   }
   async function openArchive(upload?: File) {
-    if (
-      (current.current.sessions || []).some((s) =>
-        ["running", "starting", "paused"].includes(s.status),
-      )
-    ) {
-      setError(
-        "Stop the active debugging session before replacing this project.",
-      );
-      return;
-    }
     if (!upload || lock.current) return;
     lock.current = true;
     setBusy(true);
@@ -810,12 +786,13 @@ export function App() {
     setBusy(true);
     setError("");
     try {
-      const parsed = parseHar(await upload.text());
+      if (upload.size > HAR_LIMIT) throw new Error("HAR exceeds the 25 MiB import limit.");
+      const parsed = await runResearchJob<HarImport>({ action: "har", bytes: new Uint8Array(await upload.arrayBuffer()) });
       if ((current.current.sessions || []).length >= 100)
         throw new Error("This project already has 100 runtime or imported capture sessions.");
       const evidenceByPlaceholder = new Map<string, string>();
       const capturedFiles: Evidence[] = [];
-      let available = PROJECT_LIMIT - current.current.files.reduce((sum, file) => sum + file.bytes.length, 0);
+      let available = PROJECT_LIMIT - current.current.files.reduce((sum, file) => sum + evidenceSize(file), 0);
       for (const resource of parsed.resources) {
         const hash = await sha256(resource.bytes);
         const existing = current.current.files.find((file) => file.hash === hash) || capturedFiles.find((file) => file.hash === hash);
@@ -838,7 +815,7 @@ export function App() {
         return { ...request, evidenceId: fileId, truncated: request.truncated || Boolean(request.evidenceId && !fileId) };
       });
       const id = uid();
-      const sessionBytes = new TextEncoder().encode(JSON.stringify(requests)).length + capturedFiles.reduce((sum, file) => sum + file.bytes.length, 0);
+      const sessionBytes = new TextEncoder().encode(JSON.stringify(requests)).length + capturedFiles.reduce((sum, file) => sum + evidenceSize(file), 0);
       if (sessionBytes > 50 * 1024 * 1024) throw new Error("HAR records exceed the 50 MiB session capture limit.");
       const next: Project = {
         ...current.current,
@@ -878,16 +855,6 @@ export function App() {
     }
   }
   function startNew() {
-    if (
-      (current.current.sessions || []).some((s) =>
-        ["running", "starting", "paused"].includes(s.status),
-      )
-    ) {
-      setError(
-        "Stop the active debugging session before starting another project.",
-      );
-      return;
-    }
     if (
       lock.current ||
       !window.confirm(
@@ -1052,23 +1019,23 @@ export function App() {
   );
 
   const commands: PaletteCommand[] = [
-    ...(["Overview", "Inspect", "Network", "Research", "Debug", "Report"] as const).map((section) => ({
+    ...(["Overview", "Inspect", "Network", "Observations", "Research", "Report"] as const).map((section) => ({
       id: `go-${section.toLowerCase()}`,
       label: `Go to ${section}`,
       description: {
         Overview: "Review this investigation and suggested next steps.",
         Inspect: "Browse evidence, static analysis, notes, and decoding tools.",
+        Observations: "Review saved runtime observations without executing evidence.",
         Network: "Search captured website requests, timing, headers, and response evidence.",
         Research: "Preview AST transforms, follow workspace references, and inspect observed API shapes.",
-        Debug: "Run evidence in the companion VM and inspect its behavior.",
         Report: "Review and export retained findings and observations.",
       }[section],
       keywords: `navigate ${section.toLowerCase()} view workspace`,
       run: () => setMode(section),
     })),
-    ...(file?.format === "html" ? [{ id: "render-selected", label: "Render selected HTML", description: "Open the sandboxed offline preview or choose an interactive VM preview.", keywords: "preview render html page browser", run: () => { setMode("Inspect"); setView("Render"); } }] : []),
+    ...(file?.format === "html" ? [{ id: "render-selected", label: "Render selected HTML", description: "Open the sandboxed offline preview; scripts are disabled.", keywords: "preview render html page browser", run: () => { setMode("Inspect"); setView("Render"); } }] : []),
     ...(file?.format === "wasm" ? [{ id: "inspect-wasm", label: "Open WebAssembly workbench", description: "Search indexed instructions, rename functions with aliases, inspect direct calls, and navigate to original module bytes.", keywords: "wasm webassembly disassemble instruction function rename alias references", run: () => { setMode("Inspect"); setView("Wasm"); } }] : []),
-    ...(file && ["html", "javascript", "css", "json", "sourcemap"].includes(file.format) ? [{ id: "beautify-selected", label: "Beautify selected evidence", description: "Create a formatted view in a worker while preserving the imported bytes.", keywords: "format prettify beautified source", disabledReason: beautifying ? "Beautify is already in progress." : file.bytes.length > 5 * 1024 * 1024 ? "Beautify supports sources up to 5 MiB." : undefined, run: () => { setMode("Inspect"); startBeautify(); } }] : []),
+    ...(file && ["html", "javascript", "css", "json", "sourcemap"].includes(file.format) ? [{ id: "beautify-selected", label: "Beautify selected evidence", description: "Create a formatted view in a worker while preserving the imported bytes.", keywords: "format prettify beautified source", disabledReason: beautifying ? "Beautify is already in progress." : evidenceSize(file) > 5 * 1024 * 1024 ? "Beautify supports sources up to 5 MiB." : undefined, run: () => { setMode("Inspect"); startBeautify(); } }] : []),
     {
       id: "open-welcome",
       label: "Open or show Welcome tab",
@@ -1115,7 +1082,7 @@ export function App() {
     {
       id: "new-project", label: "New project", description: "Start a new investigation after confirming the current project can be replaced.",
       keywords: "clear reset investigation",
-      disabledReason: busy || !ready ? "Wait for the current operation to finish." : runtimeActive ? "Stop the active debugging session first." : undefined,
+      disabledReason: busy || !ready ? "Wait for the current operation to finish." : undefined,
       run: startNew,
     },
     {
@@ -1206,8 +1173,8 @@ export function App() {
         </div>
       </header>
       <nav className="workflow-nav" aria-label="Investigation workflow">
-        {(["Overview", "Inspect", "Network", "Research", "Debug", "Report"] as const).map((value) => (
-          <Tooltip key={value} content={{Overview:"Project summary and suggested next steps.",Inspect:"Browse evidence, analysis results, notes, and decoding tools.",Network:"Search captured requests and open their response evidence.",Research:"Preview transformations, inspect cross-references, and review observed API shapes.",Debug:"Run selected evidence in the companion VM and inspect behavior.",Report:"Review and export investigation findings."}[value]}><button
+        {(["Overview", "Inspect", "Network", "Observations", "Research", "Report"] as const).map((value) => (
+          <Tooltip key={value} content={{Overview:"Project summary and suggested next steps.",Inspect:"Browse evidence, analysis results, notes, and decoding tools.",Network:"Search captured requests and open their response evidence.",Observations:"Review imported observations and memory snapshots; no live execution.",Research:"Preview transformations, inspect cross-references, and review observed API shapes.",Report:"Review and export investigation findings."}[value]}><button
             key={value}
             className={mode === value ? "active" : ""}
             aria-current={mode === value ? "page" : undefined}
@@ -1380,9 +1347,9 @@ export function App() {
           <div className="section-kicker">YOUR INVESTIGATION WORKSPACE</div>
           <h1>Whidra — Web-based Reverse Engineering Tool</h1>
           <p>
-            Inspect web code, trace behavior, debug, and connect evidence in one browser-based workspace.
+            Inspect web code, review captures, and connect evidence in one browser-based workspace.
           </p>
-          <div className="debug-toolbar">
+          <div className="workspace-toolbar">
             <button
               className="primary"
               disabled={busy || !ready}
@@ -1399,9 +1366,7 @@ export function App() {
             <button onClick={() => archiveInput.current?.click()}>
               Open saved project
             </button>
-            <button onClick={() => setMode("Debug")}>
-              Investigate a website URL
-            </button>
+            <button onClick={() => harInput.current?.click()}>Import HAR capture</button>
           </div>
           <div className="overview-cards">
             <article>
@@ -1413,7 +1378,7 @@ export function App() {
               <p>Observable patterns with navigable evidence</p>
             </article>
             <article>
-              <h2>{project.sessions?.length || 0} runtime sessions</h2>
+              <h2>{project.sessions?.length || 0} saved captures</h2>
               <p>Captured observations saved locally</p>
             </article>
           </div>
@@ -1450,34 +1415,24 @@ export function App() {
             <summary>Workflow help</summary>
             <p>
               Inspect shows original source, hex, symbols, findings, maps, and
-              reversible decoding. Debug requires the Windows local companion
-              and a prepared VM. Report exports your findings and captured
+              reversible decoding. Analysis runs in your browser without executing imported code. Report exports your findings and imported
               observations. Ctrl+K opens commands.
             </p>
           </details>
         </section>
       )}
-      <DebugPanel
-        active={mode === "Debug"}
-        initialEntry={debugHandoff?.entry}
-        initialSelection={debugHandoff?.files}
-        project={project}
-        update={update}
-        onNavigate={(f, start = 0) =>
-          navigate({ fileId: f.id, start, end: start })
-        }
-      />
       {mode === "Network" && <NetworkView
         sessions={project.sessions || []}
         files={project.files}
         onOpenEvidence={selectFile}
         onImportHar={() => harInput.current?.click()}
       />}
+      {mode === "Observations" && <SavedObservations project={project} />}
       {mode === "Research" && <ResearchView project={project} selection={location} update={update} navigate={navigate} />}
       {mode === "Report" && (
         <section className="guided-overview">
           <h1>Investigation report</h1>
-          <div className="debug-toolbar">
+          <div className="workspace-toolbar">
             <button
               onClick={() =>
                 download("whidra-report.md", report(project), "text/markdown")
@@ -1530,12 +1485,12 @@ export function App() {
                     </span>
                     <span className="file-label">
                       {f.name}
-                      <small>{size(f.bytes.length)}</small>
+                      <small>{size(evidenceSize(f))}</small>
                     </span>
                     <span className={`file-state ${f.result ? "analyzed" : ""}`} title={f.result ? "Analyzed" : "Awaiting analysis"} />
                   </button>
                   <span className="file-row-actions">
-                    <Tooltip content={canDeleteEvidence ? `Delete ${f.name} and its linked project records. The original file on your device is untouched.` : "Wait for analysis to finish and stop active runtime sessions before deleting evidence."}><button type="button" className="file-row-delete" title={canDeleteEvidence ? `Delete ${f.name} from this project` : "Stop analysis and active runtime sessions before deleting evidence"} aria-label={`Delete ${f.name}`} disabled={!canDeleteEvidence} onClick={(event) => { event.stopPropagation(); deleteEvidence(f); }}>×</button></Tooltip>
+                    <Tooltip content={canDeleteEvidence ? `Delete ${f.name} and its linked project records. The original file on your device is untouched.` : "Wait for analysis to finish before deleting evidence."}><button type="button" className="file-row-delete" title={canDeleteEvidence ? `Delete ${f.name} from this project` : "Wait for analysis to finish before deleting evidence"} aria-label={`Delete ${f.name}`} disabled={!canDeleteEvidence} onClick={(event) => { event.stopPropagation(); deleteEvidence(f); }}>×</button></Tooltip>
                   </span>
                 </div>
               ))
@@ -1572,7 +1527,7 @@ export function App() {
           return <div className="file-menu-dismiss" onMouseDown={() => setFileMenu(undefined)}>
             <div className="file-context-menu" role="menu" style={{ left:fileMenu.x, top:fileMenu.y }} onMouseDown={(event) => event.stopPropagation()}>
               <button role="menuitem" onClick={() => { selectFile(menuFile); setFileMenu(undefined); }}>Inspect <span>{menuFile.name}</span></button>
-              <Tooltip content={!canDeleteEvidence ? "Wait for analysis to finish and stop active runtime sessions before deleting evidence." : "Remove this evidence and its linked records from this project. The original file on your device is untouched."}><button role="menuitem" disabled={!canDeleteEvidence} title={!canDeleteEvidence ? "Stop analysis and active runtime sessions before deleting evidence" : "Remove this evidence and its linked records from the project"} onClick={() => deleteEvidence(menuFile)}>Delete <span>{menuFile.name}</span></button></Tooltip>
+              <Tooltip content={!canDeleteEvidence ? "Wait for analysis to finish before deleting evidence." : "Remove this evidence and its linked records from this project. The original file on your device is untouched."}><button role="menuitem" disabled={!canDeleteEvidence} title={!canDeleteEvidence ? "Wait for analysis to finish before deleting evidence" : "Remove this evidence and its linked records from the project"} onClick={() => deleteEvidence(menuFile)}>Delete <span>{menuFile.name}</span></button></Tooltip>
             </div>
           </div>;
         })()}
@@ -1600,7 +1555,7 @@ export function App() {
             </div>
             {file && (
               <span className="file-format">
-                {file.format.toUpperCase()} · {size(file.bytes.length)}
+                {file.format.toUpperCase()} · {size(evidenceSize(file))}
               </span>
             )}
           </div>
@@ -1642,9 +1597,10 @@ export function App() {
                   </button></Tooltip>
                 ))}
               </div>
-              <div className="view-actions"><Tooltip content="Format HTML, JavaScript, CSS, JSON, or a source map in a worker. Original evidence stays unchanged."><button onClick={startBeautify} disabled={beautifying || file.bytes.length > 5 * 1024 * 1024 || !["html", "javascript", "css", "json", "sourcemap"].includes(file.format)} title={beautifying ? "Beautifying is already in progress." : file.bytes.length > 5 * 1024 * 1024 ? "Beautify supports sources up to 5 MiB." : !["html", "javascript", "css", "json", "sourcemap"].includes(file.format) ? "This evidence format is not supported by Beautify." : "Create a formatted view; original evidence stays unchanged."}>{beautifying ? "Beautifying…" : "Beautify"}</button></Tooltip>
+              <div className="view-actions"><Tooltip content="Format HTML, JavaScript, CSS, JSON, or a source map in a worker. Original evidence stays unchanged."><button onClick={startBeautify} disabled={beautifying || evidenceSize(file) > 5 * 1024 * 1024 || !["html", "javascript", "css", "json", "sourcemap"].includes(file.format)} title={beautifying ? "Beautifying is already in progress." : evidenceSize(file) > 5 * 1024 * 1024 ? "Beautify supports sources up to 5 MiB." : !["html", "javascript", "css", "json", "sourcemap"].includes(file.format) ? "This evidence format is not supported by Beautify." : "Create a formatted view; original evidence stays unchanged."}>{beautifying ? "Beautifying…" : "Beautify"}</button></Tooltip>
                 {beautifying && <button onClick={cancelBeautify} aria-label="Cancel beautifying">Cancel</button>}</div>
               <div className="view-content">
+                {file.contentStored && evidenceSize(file) <= 2 * 1024 * 1024 && file.bytes.length !== evidenceSize(file) && <p role="status">Loading evidence from browser storage?</p>}
                 {view === "Original" && originalText !== undefined && (
                   <Editor
                     file={file}
@@ -1652,42 +1608,6 @@ export function App() {
                     original
                     location={location}
                     onSelection={setLocation}
-                    breakpointLines={(project.breakpoints || [])
-                      .filter(
-                        (bp) =>
-                          bp.url ===
-                          (file.runtimeUrl ||
-                            "http://127.0.0.1:8765/" + file.name),
-                      )
-                      .map((bp) => bp.line)}
-                    onBreakpoint={(line) => {
-                      const url =
-                        file.runtimeUrl || "http://127.0.0.1:8765/" + file.name;
-                      const existing = current.current.breakpoints?.find(
-                        (bp) => bp.url === url && bp.line === line,
-                      );
-                      const breakpoint = {
-                        id: uid(),
-                        url,
-                        line,
-                        condition: "",
-                      };
-                      update((p) => ({
-                        ...p,
-                        breakpoints: existing
-                          ? (p.breakpoints || []).filter(
-                              (bp) => bp.id !== existing.id,
-                            )
-                          : [...(p.breakpoints || []), breakpoint],
-                      }));
-                      window.dispatchEvent(
-                        new CustomEvent("wret-debug-command", {
-                          detail: existing
-                            ? { action: "removeBreakpoint", id: existing.id }
-                            : { action: "breakpoint", breakpoint },
-                        }),
-                      );
-                    }}
                   />
                 )}
                 {view === "Beautified" && (
@@ -1708,7 +1628,7 @@ export function App() {
                     />
                   </>
                 )}
-                {view === "Render" && file.format === "html" && <StaticRenderView files={project.files} file={file} onInteractive={() => startInteractivePreview(file)} />}
+                {view === "Render" && file.format === "html" && <StaticRenderView files={project.files} file={file} />}
                 {view === "WAT" && (
                   <>
                     <div className="view-help">
@@ -1758,7 +1678,7 @@ export function App() {
                           if (
                             Number.isSafeInteger(n) &&
                             n >= 0 &&
-                            n < file.bytes.length
+                            n < evidenceSize(file)
                           ) {
                             setHexPage(Math.floor(n / 512));
                             setLocation({
@@ -1783,10 +1703,10 @@ export function App() {
                       </button>
                       <span>
                         {hexPage + 1} /{" "}
-                        {Math.max(1, Math.ceil(file.bytes.length / 512))}
+                        {Math.max(1, Math.ceil(evidenceSize(file) / 512))}
                       </span>
                       <button
-                        disabled={(hexPage + 1) * 512 >= file.bytes.length}
+                        disabled={(hexPage + 1) * 512 >= evidenceSize(file)}
                         onClick={() => setHexPage((n) => n + 1)}
                       >
                         →
@@ -1803,13 +1723,13 @@ export function App() {
                       {
                         length: Math.min(
                           32,
-                          Math.ceil((file.bytes.length - hexPage * 512) / 16),
+                          Math.ceil((evidenceSize(file) - hexPage * 512) / 16),
                         ),
                       },
                       (_, row) => {
                         const offset = hexPage * 512 + row * 16,
                           bytes = Array.from(
-                            file.bytes.subarray(offset, offset + 16),
+                            hexBytes.subarray(row * 16, row * 16 + 16),
                           );
                         return (
                           <div className="hex-row" key={offset}>
@@ -1919,15 +1839,10 @@ export function App() {
                       <button
                         onClick={() => {
                           if (location?.fileId === file.id) {
-                            setDecodeOrigin(location);
-                            setDecodeInput(
-                              decodeText(
-                                file.bytes.subarray(
-                                  location.start,
-                                  location.end,
-                                ),
-                              ),
-                            );
+                            if (location.end - location.start > 1024 * 1024) { setError("Select at most 1 MiB for decoding."); return; }
+                            const range = location;
+                            const load = file.bytes.length === evidenceSize(file) ? Promise.resolve(file.bytes.slice(range.start, range.end)) : readEvidenceRange(file.id, range.start, range.end);
+                            void load.then(bytes => { setDecodeOrigin(range); setDecodeInput(decodeText(bytes)); }).catch(cause => setError(String(cause)));
                           }
                         }}
                       >
@@ -2023,7 +1938,7 @@ export function App() {
               <div className="section-kicker">WEB-BASED REVERSE ENGINEERING TOOL</div>
               <h1>Whidra</h1>
               <p>
-                Inspect web code, trace behavior, debug, and connect evidence in one browser-based workspace.
+                Inspect web code, review captures, and connect evidence in one browser-based workspace.
               </p>
               <button
                 className="primary large"
@@ -2078,7 +1993,7 @@ export function App() {
           <div className="inspector-evidence-context" title={file?.name || "No evidence selected"}>
             <span>{file?.name || "No evidence selected"}</span>
             {file?.result && !file.result.tool && <small className="legacy-result-label">Legacy analysis result · analyzer version not recorded</small>}
-            <small>{file ? `${size(file.bytes.length)} · ${file.format}` : "Choose a file in Project Explorer"}</small>
+            <small>{file ? `${size(evidenceSize(file))} · ${file.format}` : "Choose a file in Project Explorer"}</small>
           </div>
           <div className="inspector-tabs" role="tablist" aria-label="Investigation tools" aria-orientation="horizontal">
             {inspectorPanels.map((p) => (
@@ -2420,7 +2335,7 @@ export function App() {
           ) : (
             <p>
               Ready to inspect. Static analysis runs in workers. Dynamic
-              execution requires an explicitly started VM session.
+              imported code is never executed.
             </p>
           )}
         </div>

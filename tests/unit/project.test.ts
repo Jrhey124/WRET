@@ -11,6 +11,7 @@ import {
   validateProjectBudgets,
   evidenceMetadata,
   readEvidenceRange,
+  materializeEvidence,
 } from "../../src/storage";
 import { decodeValue, decompressValue } from "../../src/decoding";
 import { newProject, removeEvidence, sha256, type Project } from "../../src/model";
@@ -52,6 +53,25 @@ async function fixture(): Promise<Project> {
   return p;
 }
 describe("portable evidence and storage", () => {
+  it("reopens a 100 MiB project as metadata and preserves unloaded bytes through save and export", async () => {
+    const project = newProject();
+    for (let index = 0; index < 4; index++) {
+      const bytes = new Uint8Array(25 * 1024 * 1024); bytes[0] = index + 1;
+      project.files.push({ id: `lazy-${index}`, name: `${index}.bin`, format: "binary", bytes, hash: await sha256(bytes) });
+    }
+    await saveProject(project);
+    const loaded = (await loadProject(true))!;
+    expect(loaded.files.reduce((sum, file) => sum + file.bytes.length, 0)).toBe(0);
+    expect(loaded.files.map(file => file.byteLength)).toEqual([25, 25, 25, 25].map(size => size * 1024 * 1024));
+    await saveProject(loaded);
+    const file = await materializeEvidence(loaded.files[2]);
+    expect(file.bytes[0]).toBe(3);
+    expect(await sha256(file.bytes)).toBe(project.files[2].hash);
+    loaded.files = [loaded.files[2]];
+    const portable = await importProject(await exportProject(loaded));
+    expect(portable.files[0].hash).toBe(project.files[2].hash);
+    expect(portable.files[0].byteLength).toBeUndefined();
+  });
   it("round-trips large Base64 evidence without regex stack overflow", () => {
     const bytes = new Uint8Array(4 * 1024 * 1024);
     bytes.fill(255);

@@ -1,20 +1,14 @@
-# WRET — Web Reverse-Engineering Tool
+# Whidra - Web-based Reverse Engineering Tool
 
-## Run the application
+Inspect web code, review imported captures, and connect evidence in a browser-based workspace. Processing and project storage stay in the browser that opens Whidra. The server serves static assets; imported code is never executed.
 
-The **Research** workspace adds reviewed AST transformations, searchable lexical/module cross-references, observed API response shapes, and runtime snapshot comparison. Debug adds bounded state snapshots and explicit pause suppression. Original evidence is retained, and derived files record transformation provenance. See the [gap implementation plan](docs/GAP-IMPLEMENTATION.md) for limits and follow-up work. Current Chromium no longer supports CDP live script editing; WRET probes support and disables that action on unsupported builds.
-
-The guided workbench includes Overview, Inspect, Network, Debug, and Report workflows. Import HAR captures for offline request review; import never contacts the recorded URLs. Runtime sessions can capture approved requests and bounded response resources through the local companion. For local VM debugging, run `npm.cmd ci` and `npm.cmd run companion`, then open **http://127.0.0.1:8080**. QEMU, Windows Hypervisor Platform, and a prepared guest image are required; follow [Companion setup](docs/COMPANION.md). The Windows VM acceptance suite remains a required release check.
-
-Static inspection remains available using the Docker and development commands below. Dynamic sessions run only through the local companion. External WebSocket transport and advanced WASM runtime debugging are not supported in this implementation.
-
-For static inspection, start the Docker deployment:
+## Run
 
 ```sh
 docker compose up --build -d
 ```
 
-Open **http://localhost:8080**. For a remote server, use the included HTTPS configuration described in [Deployment](docs/DEPLOYMENT.md).
+Open http://localhost:8080. For LAN/HTTPS deployment see [Deployment](docs/DEPLOYMENT.md). The Pi does not need a companion, QEMU, KVM, or a guest image. Browser storage belongs to each origin; export before changing addresses.
 
 For development with Node.js 24:
 
@@ -23,69 +17,20 @@ npm ci
 npm run dev
 ```
 
-Validation: `npm test`, `npm run build`, then `npm run test:e2e` (install Playwright Chromium with `npx playwright install chromium`, or set `WRET_BROWSER=chrome` / `msedge`). On restricted Windows PowerShell, use `npm.cmd` / `npx.cmd`.
+## Investigation tools
 
-Import files, select a finding or symbol to navigate to original evidence, and use **Notes** to add comments, bookmarks or function labels. **Export project** writes a portable `.wret.json` archive; **Export report** writes Markdown. The browser retains the current project locally. Export it before starting a new project or changing browser/origin.
+Import files/folders or HAR captures. Inspect original source, hex, JavaScript AST, references, Wasm instructions/WAT, function aliases, findings, graphs, and source maps. Beautify and static HTML rendering preserve original evidence. Decode, decompress, and transform bounded samples into derived evidence with lineage; annotate and export a `.whidra.json` project or Markdown report.
 
-See [Development and verification](docs/DEVELOPMENT.md) for the implementation map, tool protocol, resource limits, analysis limitations and test coverage. The original MVP requirements and roadmap below describe the static baseline; the companion additions and remaining limitations are documented above and in [Companion setup](docs/COMPANION.md).
+Network and Saved observations review imported records. Runtime sessions and breakpoints from legacy projects are historical data; Whidra has no live debugging, replay, remote capture, or sample execution.
 
-## Summary
+## Verification
 
-Build a browser-based analysis workbench for security analysts investigating suspicious web files. Users select files locally; the server supplies analysis tools; processing and project storage stay in the browser.
+```sh
+npm run typecheck
+npm test
+npm run build
+npx playwright install chromium
+npm run test:e2e
+```
 
-The Ghidra inspiration is the investigation workflow: navigate code, inspect bytes, follow references, label discoveries, and save an analysis project.
-
-**First-release success:** an analyst can import an unfamiliar JavaScript/WASM sample, identify interesting functions and indicators, follow supporting references, annotate findings, and export a reproducible project.
-
-## MVP features
-
-- **Project workspace:** file explorer on the left, code or hex view in the center, references and findings on the right, analysis jobs below.
-- **File inspection:** JavaScript, HTML, CSS, JSON, source maps, and WebAssembly. Other files receive basic metadata, SHA-256 hashes, strings, and a hex view.
-- **JavaScript analysis:** formatting, syntax tree inspection, function outline, symbol references, and statically resolvable call relationships. Mark unresolved dynamic relationships explicitly.
-- **WebAssembly analysis:** section inspection, imports, exports, functions, and navigable WAT disassembly. Use browser-compatible WABT tooling; WAT is the initial representation rather than recovered high-level source. [WABT](https://github.com/WebAssembly/wabt)
-- **Investigation tools:** project-wide search, extracted URLs/domains, suspicious API usage, and a relationship graph connecting files, functions, and findings.
-- **Network investigations:** searchable request/status/timing views, request and response headers, initiator metadata, captured response evidence, and offline HAR import with body limits and credential redaction.
-- **Analyst notes:** comments, bookmarks, analyst-assigned function labels, and finding status. Preserve original evidence when creating formatted or decoded views.
-- **Reversible decoding:** Base64, hexadecimal, and URL decoding, with recorded input and transformation steps. Never execute decoded content.
-- **Export:** portable project archive and a Markdown report containing findings, notes, hashes, and evidence locations.
-
-Findings describe observable patterns; they do not automatically declare a sample malicious.
-
-## Architecture and interfaces
-
-- Use **TypeScript and React** for the interface, **Monaco** for code views, and **Web Workers** for parsing and analysis.
-- Serve the application and versioned tool bundles from a static HTTPS server. No sample-upload endpoint, accounts, or external analysis services in the MVP.
-- Load tools on demand from a first-party manifest containing tool ID, version, supported formats, entry point, and integrity hash. Pin tool versions within each project.
-- Give tools a common interface: accept evidence bytes and analysis options; emit progress, structured results, diagnostics, and evidence locations. Support cancellation and terminate stalled workers.
-- Represent evidence locations using file IDs and original byte offsets or source ranges. Derived views retain mappings to the original where available.
-- Store evidence, results, and notes in IndexedDB. Request persistent storage, handle quota failures visibly, and provide project export because browser storage may be evicted. [Browser storage behavior](https://developer.mozilla.org/en-US/docs/Web/API/Storage_API/Storage_quotas_and_eviction_criteria)
-- Display imported HTML as source. Do not instantiate imported WASM or run sample JavaScript. Workers keep analysis responsive but are not a containment boundary for executing malware.
-- Permit trusted analysis-tool downloads only; prohibit automatic fetching of URLs or source-map links found in samples. Exclude third-party analytics.
-
-## Delivery sequence and future features
-
-1. **Workbench foundation:** local import, hashes, project explorer, source/hex views, persistence, and project export/import.
-2. **JavaScript investigation:** parsing, formatting, outlines, references, search, indicator extraction, and notes.
-3. **WASM investigation:** WABT integration, section/function navigation, and linked byte/disassembly views.
-4. **MVP completion:** relationship graph, decoding history, reports, cancellation, resource limits, and privacy verification.
-
-After the MVP, prioritize:
-
-- **Sample comparison:** compare code, strings, imports, and indicators across versions.
-- **Deobfuscation assistance:** bounded constant folding and string reconstruction with a visible transformation history.
-- **Capture import:** broader saved website bundles and richer request-to-source linking.
-- **Debugging:** a separate disposable-VM execution backend controlled through WRET, providing breakpoints, stepping, variables, and captured behavior. Define this boundary before implementing execution.
-- **Advanced analysis:** WASM control-flow graphs, decompiler research, local rule packs, and eventually constrained data-flow analysis.
-
-Native PE/ELF analysis and general-purpose Ghidra parity remain outside this roadmap’s first release.
-
-## Validation and defaults
-
-- Test normal, minified, obfuscated, malformed, and truncated samples; missing source maps; stripped WASM names; and unresolved dynamic calls.
-- Confirm every reference and finding navigates to supporting evidence, and formatting or decoding preserves original bytes.
-- Verify project export/import preserves evidence, notes, results, and tool versions.
-- Test cancellation, oversized inputs, worker failures, and storage exhaustion without losing existing notes.
-- Inspect network traffic to confirm sample bytes, extracted indicators, and notes never leave the browser.
-- Start with current desktop Chrome and Edge. Support multi-file import and WRET project archives; defer arbitrary archive extraction.
-- Set initial limits of **25 MiB per file and 100 MiB per project**, with clear rejection messages and adjustable limits after performance testing.
-- No direct website browsing from the static workbench, cloud AI, or automatic malware verdicts. Dynamic execution runs explicitly in the disposable companion VM under its destination approval policy.
+Use `WRET_BROWSER=msedge` for Edge. Technical WRET storage identifiers remain for compatibility. Browser parsing uses bounded cancellable workers; large files can still require significant client memory.

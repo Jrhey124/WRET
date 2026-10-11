@@ -52,4 +52,11 @@ describe("Beautify and static preview", () => {
     const large = evidence("large.html", "x".repeat(5 * 1024 * 1024 + 1), "html");
     expect(() => buildStaticPreview([large], large)).toThrow(/5 MiB/);
   });
+  it("bounds repeated embedding of the same asset instead of multiplying preview memory", () => {
+    const page = evidence("index.html", '<img src="pixel.png">'.repeat(30), "html");
+    const image = { id: "pixel", name: "pixel.png", format: "binary" as const, bytes: new Uint8Array(1024 * 1024) };
+    const result = buildStaticPreview([page, image], page);
+    expect(result.document.length).toBeLessThan(21 * 1024 * 1024);
+    expect(result.omittedResources).toBeGreaterThan(0);
+  });
 });

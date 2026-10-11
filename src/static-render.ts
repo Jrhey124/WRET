@@ -49,7 +49,7 @@ function referencedFile(files: Map<string, Evidence>, from: string, reference: s
 
 export function buildStaticPreview(files: Evidence[], html: Evidence): StaticPreviewResult {
   const diagnostics: string[] = [];
-  let omittedResources = 0, resources = 0, resourceBytes = 0;
+  let omittedResources = 0, resources = 0, resourceBytes = 0, embeddedBytes = 0, expandedStyles = 0;
   const byPath = new Map(files.map((file) => [file.name, file]));
   const included = new Set<string>();
   const include = (file: Evidence): boolean => {
@@ -71,6 +71,10 @@ export function buildStaticPreview(files: Evidence[], html: Evidence): StaticPre
       return;
     }
     if (!include(file)) { omittedResources++; return; }
+    // Count each use, since repeating one data URL can otherwise inflate srcdoc indefinitely.
+    const encodedSize = Math.ceil(file.bytes.length / 3) * 4 + 64;
+    if (embeddedBytes + encodedSize > MAX_RESOURCE_BYTES) { omittedResources++; return; }
+    embeddedBytes += encodedSize;
     return `data:${mime};base64,${base64(file.bytes)}`;
   };
   const cssCache = new Map<string, string>();
@@ -88,7 +92,10 @@ export function buildStaticPreview(files: Evidence[], html: Evidence): StaticPre
       }
       try {
         const nested = new Set(chain); nested.add(path);
-        const parsed = postcss.parse(cssCache.get(path) || css(getText(imported), path, nested), { from: path });
+        const nestedSource = cssCache.get(path) || css(getText(imported), path, nested);
+        if (expandedStyles + nestedSource.length > MAX_RESOURCE_BYTES) throw new Error("Expanded stylesheet limit reached");
+        expandedStyles += nestedSource.length;
+        const parsed = postcss.parse(nestedSource, { from: path });
         cssCache.set(path, parsed.toString());
         if (media) rule.replaceWith(postcss.atRule({ name: "media", params: media, nodes: parsed.nodes }));
         else rule.replaceWith(...parsed.nodes);
@@ -101,7 +108,10 @@ export function buildStaticPreview(files: Evidence[], html: Evidence): StaticPre
         return url ? `url("${url}")` : 'url("")';
       });
     });
-    return root.toString();
+    const output = root.toString();
+    if (expandedStyles + output.length > MAX_RESOURCE_BYTES) throw new Error("Expanded stylesheet limit reached");
+    expandedStyles += output.length;
+    return output;
   };
 
   if (html.format !== "html") throw new Error("Static preview is available for HTML evidence.");
@@ -168,5 +178,7 @@ export function buildStaticPreview(files: Evidence[], html: Evidence): StaticPre
   if (omittedResources) diagnostics.push(`${omittedResources} local resource(s) were missing, unsupported, cyclic, or omitted by preview limits.`);
   const head = document.childNodes?.find((node: any) => node.tagName === "html")?.childNodes?.find((node: any) => node.tagName === "head");
   if (head) head.childNodes.unshift({ nodeName: "meta", tagName: "meta", attrs: [{ name: "http-equiv", value: "Content-Security-Policy" }, { name: "content", value: "default-src 'none'; base-uri 'none'; form-action 'none'; frame-src 'none'; object-src 'none'; connect-src 'none'; img-src data:; font-src data:; style-src 'unsafe-inline' data:;" }], namespaceURI: head.namespaceURI, childNodes: [], parentNode: head });
-  return { document: serialize(document), diagnostics, omittedResources, resourceIds: [...included] };
+  const output = serialize(document);
+  if (output.length > 32 * 1024 * 1024) throw new Error("Static preview exceeds its 32 MiB reconstructed document limit.");
+  return { document: output, diagnostics, omittedResources, resourceIds: [...included] };
 }
