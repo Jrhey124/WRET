@@ -141,10 +141,16 @@ def initialize(session, info):
     call('Debugger.setPauseOnExceptions', {'state': pause_exceptions}, session)
     call('Debugger.setSkipAllPauses', {'skip': skip_pauses}, session)
     call('Target.setAutoAttach', {'autoAttach': True, 'waitForDebuggerOnStart': True, 'flatten': True}, session)
-    try:
-        call('Fetch.enable', {'patterns': [{'urlPattern': '*', 'requestStage': 'Request'}]}, session)
-    except Exception as error:
-        observe('diagnostic', 'Request interception unavailable on target: ' + str(error))
+    target_type = info.get('type', 'unknown')
+    if target_type in ['page', 'iframe']:
+        try:
+            call('Fetch.enable', {'patterns': [{'urlPattern': '*', 'requestStage': 'Request'}]}, session)
+        except Exception as error:
+            observe('diagnostic', f'Request interception unavailable on {target_type} target: {error}. The guest has no network adapter; external access remains blocked.')
+    elif target_type in ['worker', 'shared_worker', 'service_worker']:
+        # Chromium does not expose CDP Fetch interception in every worker target.
+        # The VM's lack of a network adapter remains the enforcement boundary.
+        observe('diagnostic', f'Per-request broker interception is unavailable for {target_type} targets in this Chromium build; guest network isolation still blocks direct external access.')
     for bp in list(breakpoints.values()):
         set_breakpoint(session, bp['definition'])
     if info.get('type') in ['page', 'iframe']:
