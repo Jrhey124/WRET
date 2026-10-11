@@ -8,7 +8,7 @@ This image provides static inspection. Dynamic debugging runs through `npm.cmd r
 docker compose up --build -d
 ```
 
-Open **http://localhost:8080**. Localhost is a browser secure context, so Web Crypto and IndexedDB work without a local certificate. The port binds to loopback only. The final image contains nginx and static assets; Node and build dependencies stay in the build stage.
+Open **http://localhost:8080**. Localhost is treated as a secure browser context, so Web Crypto and IndexedDB work without a local certificate. For LAN HTTP, Whidra has compatibility fallbacks for IDs and SHA-256 hashing, but HTTPS is recommended for a secure context and broader browser API support. The port binds to loopback only. The final image contains nginx and static assets; Node and build dependencies stay in the build stage.
 
 If Docker Desktop is installed per-user on Windows but `docker` is not on PATH, open its integrated terminal or temporarily add `$env:LOCALAPPDATA\Programs\DockerDesktop\resources\bin` to PATH.
 

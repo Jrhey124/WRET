@@ -1,6 +1,7 @@
 import type { Evidence, Location } from "./model";
 import type { Recipe, TransformPreview } from "./gap-analysis";
 import { WORKER_TIMEOUT } from "./runtime";
+import { uid } from "./model";
 
 type Message =
   | { action: "index"; files: Evidence[] }
@@ -11,7 +12,7 @@ type Message =
 export function runResearchJob<T>(message: Message, signal?: AbortSignal): Promise<T> {
   return new Promise((resolve, reject) => {
     const worker = new Worker(new URL("./research.worker.ts", import.meta.url), { type: "module" });
-    const id = crypto.randomUUID();
+    const id = uid();
     const timer = setTimeout(() => finish(new Error("Research exceeded the 10 second job limit; the worker was terminated.")), WORKER_TIMEOUT);
     const cleanup = () => { clearTimeout(timer); signal?.removeEventListener("abort", abort); worker.terminate(); };
     const finish = (error?: Error, value?: T) => { cleanup(); error ? reject(error) : resolve(value as T); };

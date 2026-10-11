@@ -5,6 +5,7 @@ import { analyze as analyzeScopes } from "eslint-scope";
 import {
   decodeText,
   sourceLineStarts,
+  uid,
   type Evidence,
   type Location,
 } from "./model";
@@ -118,7 +119,7 @@ export function embeddedSources(files: Evidence[]): Evidence[] {
         )
           throw new Error("Embedded source evidence exceeds project limits");
         added.push({
-          id: crypto.randomUUID(),
+          id: uid(),
           name,
           bytes,
           format: name.endsWith(".css")
